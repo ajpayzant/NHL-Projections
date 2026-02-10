@@ -1,0 +1,14 @@
+# data artifacts
+data/
+**/*.parquet
+**/*.joblib
+**/*.csv
+
+# secrets
+.env
+*.json
+
+# python
+__pycache__/
+.ipynb_checkpoints/
+.venv/
