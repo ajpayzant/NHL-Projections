@@ -19,30 +19,87 @@ def fetch_json(url, timeout=30):
     r.raise_for_status()
     return r.json()
 
+def _is_regular_season_game(game):
+    game_type = game.get("gameType")
+    # NHL API uses integer 2 for regular season in schedule/score payloads.
+    return game_type in (2, "2", "R")
+
+def _pull_games_from_schedule_payload(payload, date_from, date_to):
+    rows = []
+    for day in payload.get("gameWeek", []):
+        day_date = pd.to_datetime(day.get("date"), errors="coerce")
+        if pd.isna(day_date):
+            continue
+        day_date = day_date.date()
+        if day_date < date_from or day_date > date_to:
+            continue
+        for g in day.get("games", []):
+            if not _is_regular_season_game(g):
+                continue
+            rows.append({
+                "gameId": g.get("id"),
+                "gameDateUTC": g.get("startTimeUTC"),
+                "homeTeam": g.get("homeTeam", {}).get("abbrev"),
+                "awayTeam": g.get("awayTeam", {}).get("abbrev"),
+                "scheduleDate": str(day_date),
+            })
+    return rows
+
+def _pull_games_from_score_payload(payload, date_from, date_to):
+    rows = []
+    game_date = pd.to_datetime(payload.get("currentDate"), errors="coerce")
+    if pd.isna(game_date):
+        return rows
+    game_date = game_date.date()
+    if not (date_from <= game_date <= date_to):
+        return rows
+    for g in payload.get("games", []):
+        if not _is_regular_season_game(g):
+            continue
+        rows.append({
+            "gameId": g.get("id"),
+            "gameDateUTC": g.get("startTimeUTC"),
+            "homeTeam": g.get("homeTeam", {}).get("abbrev"),
+            "awayTeam": g.get("awayTeam", {}).get("abbrev"),
+            "scheduleDate": str(game_date),
+        })
+    return rows
+
 def get_schedule(date_from, date_to):
     games = []
     d = date_from
     while d <= date_to:
         ds = d.strftime("%Y-%m-%d")
-        url = f"https://api-web.nhle.com/v1/schedule/{ds}"
-        data = fetch_json(url)
-        for day in data.get("gameWeek", []):
-            for g in day.get("games", []):
-                if g.get("gameType") not in (2, "R"):
-                    continue
-                home = g.get("homeTeam", {}).get("abbrev", None)
-                away = g.get("awayTeam", {}).get("abbrev", None)
-                gid  = g.get("id", None)
-                gdt  = g.get("startTimeUTC", None)
-                games.append({
-                    "gameId": gid,
-                    "gameDateUTC": gdt,
-                    "homeTeam": home,
-                    "awayTeam": away,
-                    "scheduleDate": ds
-                })
+        schedule_url = f"https://api-web.nhle.com/v1/schedule/{ds}"
+        pulled_for_day = 0
+        try:
+            schedule_payload = fetch_json(schedule_url)
+            day_rows = _pull_games_from_schedule_payload(schedule_payload, date_from, date_to)
+            games.extend(day_rows)
+            pulled_for_day = len(day_rows)
+        except Exception as e:
+            print(f"⚠️ schedule endpoint failed for {ds}: {e}")
+
+        # Fallback: score endpoint can still return a day's slate if schedule is unavailable.
+        if pulled_for_day == 0:
+            score_url = f"https://api-web.nhle.com/v1/score/{ds}"
+            try:
+                score_payload = fetch_json(score_url)
+                games.extend(_pull_games_from_score_payload(score_payload, date_from, date_to))
+            except Exception as e:
+                print(f"⚠️ score endpoint failed for {ds}: {e}")
+
         d += timedelta(days=1)
-    return pd.DataFrame(games)
+
+    out = pd.DataFrame(games)
+    if out.empty:
+        return out
+    out = out.dropna(subset=["gameId", "homeTeam", "awayTeam"]).copy()
+    out["gameId"] = pd.to_numeric(out["gameId"], errors="coerce").astype("Int64")
+    out = out.dropna(subset=["gameId"]).copy()
+    out["gameId"] = out["gameId"].astype("int64")
+    out = out.drop_duplicates(subset=["gameId"], keep="first").reset_index(drop=True)
+    return out
 
 def main():
     ap = argparse.ArgumentParser()
