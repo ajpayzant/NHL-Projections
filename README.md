@@ -75,7 +75,7 @@ publishing still works, it just does not survive a restart.
 
 ## The app
 
-`app/streamlit_app.py` — ten pages, all reading the same cached projection:
+`app/streamlit_app.py` — eleven pages, all reading the same cached projection:
 
 - **Overview** — where the season stands, the leaders, how many edits you have made
 - **Player dashboard** — one skater or goalie at a time: every prior season as totals *and* as
@@ -93,6 +93,21 @@ publishing still works, it just does not survive a restart.
   is plausible against the last one, three and five years), a **roster review** of where the ice
   time and the power play go and how old the team is by minute, the **schedule** it faces, and
   the budget edit form. This is where a projection that looks low explains itself
+- **Lines** — the forward lines and defence pairings, as a card you edit. The model reads five
+  seasons of a player's own history, which already contains his old linemates, so the only thing
+  a lineup can add is the *change*: a new centre, a promotion into a scoring line, a trade. That
+  change in linemate quality is what gets applied (`lines.py`), and the page shows what saving it
+  would do before you save it and what the saved ones have actually done after budgets settle.
+  Line *numbers* do not matter here — only who skates with whom; what a promotion is worth in
+  ice time is a bigger, separate edit on the player's own page. Pairings are stored for realism
+  and deliberately not scored, because the same test on them found no accuracy gain at all.
+  Measured worth: about 0.9% off per-60 error and 0.4% off season point error league-wide
+  (`python backtest.py --lines`), concentrated on the four forwards in ten whose deployment moved.
+  Every dropdown lists the team's camp players as well as its roster, so a rookie the September
+  roster cut dropped can be named on a line; saving the card puts him on the roster, which is the
+  same edit as giving him a team on his own page. His ice time stays the model's guess until you
+  say otherwise there, and a player with no NHL games has no linemate value, so the line
+  arithmetic cannot see him in either direction
 - **Game by game** — the season total spread over the real schedule
 - **Scenario** — every edit in one list, each one removable, plus the league-wide settings
 - **Model check** — the accounting identities, the measured constants, and how old the data is
@@ -108,7 +123,7 @@ saved under a name, downloaded, and mailed to someone.
 
 ### Overriding a projection
 
-Three kinds of edit, all reversible:
+Four kinds of edit, all reversible:
 
 - **Inputs** — games played, ice time, power-play ice time, a per-60 rate. These flow through
   the model: raise a player's ice time and his goals, shots and blocks all move, and his
@@ -118,6 +133,9 @@ Three kinds of edit, all reversible:
   being quietly rescaled away.
 - **Structural** — his team, or whether he is on a roster at all. This is how a signing or a
   trade gets in before the published roster catches up.
+- **Lineups** — who a player skates with, saved per team on the **Lines** page. One lineup is
+  one edit: undoing it drops the whole card, because half a lineup is not a statement about
+  anybody's linemates.
 
 Team budgets and the league knobs are editable on the same terms. The legacy
 `gp_overrides.csv` is still read, so anything already written in it keeps working.
@@ -264,6 +282,14 @@ the weeks before a season), and refresh last night's stats.
 model beats "last season = next season" and "3-year average" on RMSE every season tested
 (2022-2025) and cuts per-60 rate error ~13% versus last-season-only.
 
+`python backtest.py --lines` adds the line-chemistry check to the same harness: the identical
+projection plus the change in each player's linemates, scored against the same actuals. On
+2022-2025 it takes per-60 error from 0.336 to 0.333 (0.9%) and season point error from 9.32 to
+9.28 (0.4%), an improvement in three of the four seasons. Those are league-wide averages over a
+population where only ~4 forwards in 10 have a linemate change at all, so the effect on the
+players the feature is about is roughly 2.5x that. If this ever goes negative, `LINES_BETA` no
+longer earns its place and the run says so out loud.
+
 The goalie start allocation was calibrated on 269 clean team-seasons (2012-2025): share MSE
 0.02454 → 0.02068, busiest-goalie start error 11.3 → 10.6 games, top-goalie identification
 73% → 75%.
@@ -307,6 +333,7 @@ able to read a record it did not create.
 - `allocate.py` — the settle step: claims against a budget
 - `overrides.py` — scenarios (the edits, and the rules for what is editable)
 - `context.py` — team strength ratings, per-game schedule context
+- `lines.py` — linemate quality and what a saved lineup changes about it
 - `live.py` — the season in progress: where it stands, what is banked, how fast to believe it
 - `snapshots.py` — dated projections and the scoring behind the Model performance page
 - `project_skaters.py` / `project_goalies.py` — the season models

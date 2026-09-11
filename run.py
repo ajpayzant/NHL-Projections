@@ -6,6 +6,7 @@ Usage:
     python run.py --refresh-live  # re-download only the season in progress (3 requests)
     python run.py --snapshot      # also file a dated snapshot for the performance page
     python run.py --backtest      # also run the accuracy backtest
+    python run.py --backtest --lines   # ... including the line-chemistry check
 """
 from __future__ import annotations
 
@@ -25,6 +26,8 @@ def main():
     ap.add_argument("--snapshot", action="store_true",
                     help="file a dated snapshot of the baseline projection")
     ap.add_argument("--backtest", action="store_true", help="run accuracy backtest")
+    ap.add_argument("--lines", action="store_true",
+                    help="with --backtest, also score the line-chemistry adjustment")
     ap.add_argument("--games", action="store_true", help="also write game-by-game projections")
     args = ap.parse_args()
 
@@ -34,6 +37,7 @@ def main():
         dl.load_moneypuck_skaters_pp(refresh=True)
         dl.load_moneypuck_goalies(refresh=True)
         dl.load_moneypuck_teams(refresh=True)
+        dl.load_moneypuck_lines(refresh=True)
         dl.load_nhl_skater_bios(refresh=True)
         dl.load_nhl_goalie_summary(refresh=True)
         dl.load_rosters(refresh=True)
@@ -81,9 +85,8 @@ def main():
 
     if args.backtest:
         print("\n=== Backtest ===")
-        import backtest  # noqa: F401  (module runs its report on import? no — call it)
-        import runpy
-        runpy.run_module("backtest", run_name="__main__")
+        import backtest
+        backtest.main(with_lines=args.lines)
 
 
 if __name__ == "__main__":

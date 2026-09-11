@@ -31,11 +31,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-from views import (edits, export, games, goalies, home, model,  # noqa: E402
+from views import (edits, export, games, goalies, home, lines, model,  # noqa: E402
                    performance, player, skaters, teams)
 
 # Every view exposes a callable called `page`, so the URL path has to be given
-# explicitly -- Streamlit would otherwise infer all ten as "page".
+# explicitly -- Streamlit would otherwise infer all eleven as "page".
 PAGES = [
     st.Page(home.page, title="Overview", icon=":material/home:", url_path="overview",
             default=True),
@@ -45,6 +45,7 @@ PAGES = [
             url_path="skaters"),
     st.Page(goalies.page, title="Goalies", icon=":material/shield:", url_path="goalies"),
     st.Page(teams.page, title="Teams", icon=":material/groups:", url_path="teams"),
+    st.Page(lines.page, title="Lines", icon=":material/reorder:", url_path="lines"),
     st.Page(games.page, title="Game by game", icon=":material/calendar_month:",
             url_path="games"),
     st.Page(edits.page, title="Scenario", icon=":material/edit_note:",

@@ -542,10 +542,24 @@ def load_moneypuck_lines(refresh: bool = False) -> pd.DataFrame:
 
     `lineId` is the players' NHL ids concatenated (7 digits each): a 14-digit id is a
     defense pairing, a 21-digit id is a forward line. Carries xG%/Corsi%/TOI per unit.
+
+    lineId is kept as a STRING throughout. A forward line's id is 21 digits, which
+    overflows int64 -- pandas hands it back as an object column of Python ints, and
+    writing that to parquet raises `OverflowError: int too big to convert`. Casting to
+    str is also the only safe representation: any numeric cast that did succeed would
+    be float64, which silently rounds a 21-digit id and scrambles the player ids.
+
+    Only the columns below are cached. MoneyPuck ships 109 columns per unit, which is
+    19 MB of parquet for 18 seasons; this repo commits its data, so the full file would
+    roughly double what is checked in to hold shot-location detail nothing reads. The
+    11-column zstd cache is 2.2 MB.
     """
     cache = C.DATA_RAW / "mp_lines.parquet"
     if cache.exists() and not refresh:
         return pd.read_parquet(cache)
+    keep = ["lineId", "mp_season_year", "team", "position", "games_played", "icetime",
+            "xGoalsPercentage", "corsiPercentage", "xGoalsFor", "goalsFor",
+            "shotAttemptsFor"]
     frames = []
     for yr in C.HISTORY_SEASONS:
         try:
@@ -553,9 +567,10 @@ def load_moneypuck_lines(refresh: bool = False) -> pd.DataFrame:
         except requests.HTTPError:
             continue
         df = df[df["situation"] == "5on5"].copy()
-        frames.append(df)
+        df["lineId"] = df["lineId"].map(lambda v: str(v).split(".")[0])
+        frames.append(df[[c for c in keep if c in df.columns]])
     out = pd.concat(frames, ignore_index=True)
-    out.to_parquet(cache, index=False)
+    out.to_parquet(cache, index=False, compression="zstd")
     return out
 
 
@@ -578,9 +593,18 @@ def load_moneypuck_teams(refresh: bool = False) -> pd.DataFrame:
 
 
 def split_line_ids(line_id) -> list[int]:
-    """Decompose a MoneyPuck lineId into its 7-digit NHL player ids."""
-    s = str(int(line_id))
+    """Decompose a MoneyPuck lineId into its 7-digit NHL player ids.
+
+    Tolerates a float-looking id ("4560871.0") so this works on a raw CSV read as well
+    as on the cached string column.
+    """
+    s = str(line_id).split(".")[0]
     return [int(s[i:i + 7]) for i in range(0, len(s), 7)]
+
+
+def make_line_id(player_ids) -> str:
+    """Inverse of split_line_ids: 7-digit-pad and concatenate, in the order given."""
+    return "".join(f"{int(p):07d}" for p in player_ids)
 
 
 def player_birthdates(bios: pd.DataFrame) -> pd.DataFrame:

@@ -49,6 +49,7 @@ import data_layer as dl
 import age_curves as ac
 import allocate as al
 import budgets as bg
+import lines as ln
 import live
 import overrides as ov
 
@@ -442,6 +443,59 @@ def _init_edit_cols(out: pd.DataFrame) -> None:
         out[f"lock_{col}"] = False
         if col in COUNT_STATS:
             out[f"fixed_{col}"] = np.nan
+
+
+def _apply_line_chemistry(out: pd.DataFrame, sc: ov.Scenario | None) -> pd.DataFrame:
+    """Nudge scoring rates by the CHANGE in a player's linemates, if lines were saved.
+
+    See `lines.py` for what is being measured and why only the change is usable. Here is
+    what happens to the numbers:
+
+      delta (points per 60) = beta * clamp(dLQ)
+      multiplier            = 1 + delta / (his even-strength points per 60)
+
+    The fitted effect is additive in points per 60, but it is applied as a MULTIPLIER so a
+    goal-scorer's bump lands on his goals and a passer's on his assists, instead of every
+    player being handed the same synthetic mix. The whole effect goes on even-strength
+    scoring -- it is a 5on5 measurement, so it must not inflate power-play production, and
+    the even-strength rate is therefore also the denominator that keeps the point total
+    right.
+
+    Runs BEFORE `_apply_input_edits` on purpose: an explicit `rate_goals` override then
+    overwrites the adjusted rate outright, so a reader who states a rate gets exactly that
+    rate and there is no flag column to keep in step. It also runs before the budgets are
+    settled, so promoting a player pushes his production up and the settle step takes the
+    minutes back off his teammates rather than inventing goals for the team.
+
+    Both new columns are always present -- 0.0 and 1.0 when nothing is saved -- so the app
+    can show "no line effect" without having to know whether the feature ran.
+    """
+    out["lines_dlq"] = 0.0
+    out["lines_rate_mult"] = 1.0
+    lvl = (sc.league if sc else {}) or {}
+    beta = float(lvl.get("lines_beta", C.LINES_BETA))
+    saved = getattr(sc, "lines", None) if sc else None
+    if not saved or beta == 0.0:
+        return out
+    dlq = ln.delta_lq(saved)
+    if dlq.empty:
+        return out
+
+    # Matched on team as well as playerId: a lineup that still names a departed player
+    # must not follow him to his new team. See `lines.delta_lq`.
+    key = out[["team", "playerId"]].merge(dlq, on=["team", "playerId"], how="left")
+    d = key["lines_dlq"].astype(float).fillna(0.0).to_numpy()
+    d = np.clip(d, -C.LINES_MAX_DLQ, C.LINES_MAX_DLQ)
+    even = sum(out[f"rate_{s}"] for s in C.LINES_STATS)
+    # A player with no even-strength scoring rate has no denominator, so no multiplier can
+    # express the effect for him; he is left alone rather than divided by zero.
+    mult = np.where(even > 0, 1.0 + beta * d / even.where(even > 0, 1.0), 1.0)
+    mult = np.clip(mult, 1.0 - C.LINES_MAX_RATE_CHANGE, 1.0 + C.LINES_MAX_RATE_CHANGE)
+    out["lines_dlq"] = d
+    out["lines_rate_mult"] = mult
+    for stat in (*C.LINES_STATS, *C.LINES_FOLLOW_STATS):
+        out[f"rate_{stat}"] = out[f"rate_{stat}"] * mult
+    return out
 
 
 def _apply_input_edits(out: pd.DataFrame, sc: ov.Scenario | None,
@@ -984,6 +1038,7 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
                          + xg_weight * out["rate_ixg"] * xg_scale)
 
     out = out.reset_index(drop=True)
+    out = _apply_line_chemistry(out, sc)
     out = _apply_input_edits(out, sc, ov.gp_override_csv())
     # Edits run AFTER the camp cut on purpose: naming a team for a player the cut dropped
     # is how a reader says "he made the team", and it has to win over the model's guess.

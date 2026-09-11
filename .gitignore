@@ -2,7 +2,7 @@
 # secrets store, so this file exists only on a developer's machine.
 .streamlit/secrets.toml
 
-# The cached source data IS committed (data/raw/*.parquet, ~19 MB). It is what lets a
+# The cached source data IS committed (data/raw/*.parquet, ~21 MB). It is what lets a
 # fresh deploy boot in seconds instead of making a few hundred API calls, and it pins the
 # numbers a shared app is serving to something reviewable. Refresh it deliberately:
 #   python run.py --refresh   (then commit the diff)

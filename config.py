@@ -331,6 +331,75 @@ SKATER_OPP_STRENGTH = 0.5   # 0 = ignore opponent, 1 = full team-defense delta
 HOME_ICE_BOOST = 0.015      # ~1.5% offensive bump at home (mean-0 across balanced schedule)
 B2B_PENALTY = 0.04          # 4% production penalty on the 2nd night of a back-to-back
 
+# --- Line chemistry (5on5 linemates) -----------------------------------------
+# A player's own history already contains whatever his old linemates did for him, so
+# the only thing line data can add is the CHANGE in who he plays with. LQ ("linemate
+# quality") values each linemate by a regressed prior-seasons-only 5on5 points/60, and
+# the projection is nudged by beta * (LQ_new - LQ_old).
+#
+# What a lineup card can say, and what it is worth
+# ------------------------------------------------
+# A nominal line is NOT a player's deployment: the median skater spends only 36% of his
+# 5on5 minutes on his single most-used unit (mean 43%, quartiles 26%/53%). NHL lines churn.
+# So LQ from a lineup card is a blend of the trio and the rest of the pool:
+#
+#   LQ = LINES_UNIT_SHARE * mean(q of his linemates)
+#      + (1 - LINES_UNIT_SHARE) * mean(q of the team's other forwards)
+#
+# Both terms are known from a lineup card. Measured leave-one-season-out (2022-2025,
+# skaters with 300+ actual TOI, n=1605): per-60 rate MAE 0.380 -> 0.376 (+1.3%), season
+# point MAE 10.85 -> 10.75 (+0.9%).
+#
+# Re-run inside the repo's own harness -- `python backtest.py --lines`, which is the number
+# to trust because it scores the production model rather than a standalone reimplementation
+# -- the gain is smaller against that stronger baseline: rate MAE 0.336 -> 0.333 (+0.9%),
+# point MAE 9.32 -> 9.28 (+0.4%), positive in 2022, 2023 and 2025 and -0.2% on rate in 2024.
+# Only about 265 of 640 scored skaters have a linemate change at all, so the per-player
+# effect on those is roughly 2.5x the headline.
+#
+# The share is deliberately not tuned: the gain is flat at +1.1% to +1.3% for every value
+# from 0.40 to 1.00, so this is a scale choice, not a fitted parameter. 0.60 is picked
+# because it puts sd(dLQ) at 0.191, matching the TOI-weighted definition's 0.195, which
+# keeps the clamps below meaningful.
+LINES_UNIT_SHARE = 0.60
+# beta belongs to the definition above and must not be borrowed from another one. Fit on
+# 2015-2025 (n=4231, beta=+0.415; 2019-25 +0.401; 2022-25 +0.394), positive in all 11
+# individual seasons (+0.148 to +0.618). The TOI-weighted definition fits +0.61 instead,
+# and using that number here would over-apply the adjustment by roughly 50%.
+LINES_BETA = 0.40
+LINES_QUALITY_SEASONS = 3      # lookback behind each linemate's quality estimate
+LINES_QUALITY_REGRESS_TOI = 300.0   # shrink to the position mean, as skater rates do
+LINES_MIN_UNIT_TOI = 20.0      # minutes; ignore line combos that barely happened
+# The ceiling, for context: scoring the same feature on each player's REALIZED TOI-weighted
+# deployment instead of a nominal card gives +3.5% rate MAE and +1.8% point MAE. That is
+# not knowable before a season, but it is knowable DURING one, so the in-season path is
+# where the rest of this signal lives.
+#
+# Clamps. sd(dLQ) is ~0.18 and p99|dLQ| ~0.53, so +/-0.60 is a ~99.5th-percentile line
+# change: it lets a real top-line promotion through and stops a half-typed line (one
+# star plus two unknowns) from asking for an absurd swing.
+LINES_MAX_DLQ = 0.60
+LINES_MAX_RATE_CHANGE = 0.15   # and never move a player's scoring rate by more than 15%
+# The effect is on scoring only -- linemates do not change how often you block a shot.
+# One multiplier is applied across these three, so the goals/assists mix is preserved, and
+# they are also the denominator that turns the fitted per-60 effect into that multiplier.
+LINES_STATS = ("goals", "primaryAssists", "secondaryAssists")
+# ixg rides along with goals on no evidence of its own, purely so the proj_goals vs
+# proj_ixg gap keeps meaning "how much of this is his shooting hands". Leaving it behind
+# would make a deployment bump read as a finishing bump. Shots, blocks and hits are
+# untouched: the effect was measured on scoring and is not extrapolated past it.
+LINES_FOLLOW_STATS = ("ixg",)
+# The cap is a safety rail, not a tuning knob: at 15% it binds on 1.0% of players, keeps
+# 99.5% of the fitted effect, and costs nothing measurable (tested 5% / 10% / 15% / 20% /
+# 30% / uncapped -- every value from 10% up scores identically).
+# Editable unit shape per team: 4 forward lines of 3, 3 pairings of 2. Pairings are
+# editable for realism but do NOT score -- the same test on 14-digit (defense) lineIds
+# found corr +0.054 and a leave-one-season-out change of -0.1%, i.e. nothing.
+LINES_FORWARD_UNITS = 4
+LINES_FORWARD_SIZE = 3
+LINES_PAIR_UNITS = 3
+LINES_PAIR_SIZE = 2
+
 # --- Scenarios / overrides ----------------------------------------------------
 # The workbook could only be read; the Streamlit app can be argued with. A scenario
 # is a JSON file of disagreements with the model -- per player, per team, or a league
@@ -353,6 +422,7 @@ def league_defaults() -> dict:
         "skater_regress_toi_min": SKATER_REGRESS_TOI_MIN,
         "goalie_regress_shots": GOALIE_REGRESS_SHOTS,
         "season_games": SEASON_GAMES,
+        "lines_beta": LINES_BETA,
     }
 
 # --- Counting stats -----------------------------------------------------------

@@ -19,8 +19,13 @@ and `is_baseline` is a real question with a real answer. Three kinds of edit:
                  around what is left. This is the edit that makes the budget useful
                  rather than an obstacle: stating one player's total redistributes the
                  rest instead of being quietly rescaled away.
-  structural  -- his team, whether he is on a roster at all. This is how a signing or a
-                 trade gets in before the published roster catches up.
+  structural  -- his team, whether he is on a roster at all, and his team's LINES. This is
+                 how a signing or a trade gets in before the published roster catches up,
+                 and how "he is on the first line now" gets in at all.
+
+Lines are stored per team rather than per player, because a line is a shared object: you
+cannot promote one winger without saying who he is playing with. A team with no entry gets
+no line effect whatsoever, which keeps the silence-means-baseline rule intact.
 
 Team budgets and the league knobs are editable on the same terms, and clearing an edit
 is always possible and always exact, because the baseline was never overwritten.
@@ -81,17 +86,21 @@ class Scenario:
     teams: dict[str, dict[str, Any]] = field(default_factory=dict)
     league: dict[str, Any] = field(default_factory=dict)
     notes: dict[str, str] = field(default_factory=dict)
+    # team -> unit label ("L1".."L4", "D1".."D3") -> list of playerIds
+    lines: dict[str, dict[str, list[int]]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ state
     @property
     def is_baseline(self) -> bool:
-        return not (self.players or self.goalies or self.teams or self.league)
+        return not (self.players or self.goalies or self.teams or self.league
+                    or self.lines)
 
     @property
     def digest(self) -> str:
         """Stable hash of the edits, so a cache can be keyed on "which scenario"."""
         blob = json.dumps(
-            {"p": self.players, "g": self.goalies, "t": self.teams, "l": self.league},
+            {"p": self.players, "g": self.goalies, "t": self.teams, "l": self.league,
+             "n": self.lines},
             sort_keys=True, default=str)
         return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
@@ -99,9 +108,11 @@ class Scenario:
         return {
             "players": len(self.players), "goalies": len(self.goalies),
             "teams": len(self.teams), "league": len(self.league),
+            "lines": len(self.lines),
             "edits": sum(len(v) for v in self.players.values())
                      + sum(len(v) for v in self.goalies.values())
-                     + sum(len(v) for v in self.teams.values()) + len(self.league),
+                     + sum(len(v) for v in self.teams.values()) + len(self.league)
+                     + len(self.lines),
         }
 
     # ------------------------------------------------------------------ reads
@@ -124,6 +135,15 @@ class Scenario:
     def edited_ids(self) -> set[str]:
         return set(self.players) | set(self.goalies)
 
+    def team_lines(self, team: str) -> dict[str, list[int]]:
+        return {k: [int(p) for p in v]
+                for k, v in (self.lines.get(str(team)) or {}).items()}
+
+    def lined_ids(self) -> set[int]:
+        """Every playerId named on any saved line -- who the line effect can reach."""
+        return {int(p) for units in self.lines.values()
+                for ids in units.values() for p in ids}
+
     # ------------------------------------------------------------------ writes
     def set_player(self, pid, **fields) -> "Scenario":
         return self._set("players", pid, fields, allowed=self._player_fields())
@@ -134,14 +154,45 @@ class Scenario:
     def set_team(self, team, **fields) -> "Scenario":
         return self._set("teams", team, fields, allowed=None)
 
+    def set_lines(self, team, units: dict[str, list] | None) -> "Scenario":
+        """Save one team's lineup. `None`, or an empty lineup, clears it.
+
+        Units of fewer than two players are dropped: a line with one name on it says
+        nothing about who anybody plays with, so storing it would only make the scenario
+        look edited without changing a projection.
+        """
+        store = self._buckets()
+        lines = {k: {kk: list(vv) for kk, vv in v.items()} for k, v in self.lines.items()}
+        key = str(team)
+        clean = {str(label): [int(p) for p in ids if p not in (None, "")]
+                 for label, ids in (units or {}).items()}
+        clean = {k: v for k, v in clean.items() if len(v) > 1}
+        if clean:
+            lines[key] = clean
+        else:
+            lines.pop(key, None)
+        return Scenario(name=self.name, league=dict(self.league), notes=dict(self.notes),
+                        lines=lines, **store)
+
+    def clear_lines(self, *teams) -> "Scenario":
+        """Drop saved lineups. With no arguments, every team's."""
+        lines = {} if not teams else {
+            k: {kk: list(vv) for kk, vv in v.items()} for k, v in self.lines.items()
+            if k not in {str(t) for t in teams}}
+        return Scenario(name=self.name, league=dict(self.league), notes=dict(self.notes),
+                        lines=lines, **self._buckets())
+
+    def _buckets(self) -> dict:
+        return {b: {k: dict(v) for k, v in getattr(self, b).items()}
+                for b in ("players", "goalies", "teams")}
+
     def _player_fields(self) -> set[str]:
         return set(INPUT_FIELDS) | set(LOCKABLE) | set(STRUCTURAL) | {
             RATE_PREFIX + s for s in C.SKATER_STATS}
 
     def _set(self, bucket: str, key, fields: dict, allowed: set[str] | None) -> "Scenario":
         key = str(key)
-        store = {b: {k: dict(v) for k, v in getattr(self, b).items()}
-                 for b in ("players", "goalies", "teams")}
+        store = self._buckets()
         entry = store[bucket].setdefault(key, {})
         for k, v in fields.items():
             if allowed is not None and k not in allowed:
@@ -155,7 +206,7 @@ class Scenario:
         if not entry:
             store[bucket].pop(key, None)
         return Scenario(name=self.name, league=dict(self.league), notes=dict(self.notes),
-                        **store)
+                        lines=self._lines_copy(), **store)
 
     def clear_player(self, *pids) -> "Scenario":
         return self._clear("players", pids)
@@ -167,12 +218,14 @@ class Scenario:
         return self._clear("teams", teams)
 
     def _clear(self, bucket: str, keys) -> "Scenario":
-        store = {b: {k: dict(v) for k, v in getattr(self, b).items()}
-                 for b in ("players", "goalies", "teams")}
+        store = self._buckets()
         for k in keys:
             store[bucket].pop(str(k), None)
         return Scenario(name=self.name, league=dict(self.league), notes=dict(self.notes),
-                        **store)
+                        lines=self._lines_copy(), **store)
+
+    def _lines_copy(self) -> dict:
+        return {k: {kk: list(vv) for kk, vv in v.items()} for k, v in self.lines.items()}
 
     def clear_all(self) -> "Scenario":
         return Scenario(name=self.name)
@@ -189,24 +242,27 @@ class Scenario:
                 league.pop(k, None)
             else:
                 league[k] = _clean(v)
-        return Scenario(name=self.name, players={k: dict(v) for k, v in self.players.items()},
-                        goalies={k: dict(v) for k, v in self.goalies.items()},
-                        teams={k: dict(v) for k, v in self.teams.items()},
-                        league=league, notes=dict(self.notes))
+        return Scenario(name=self.name, league=league, notes=dict(self.notes),
+                        lines=self._lines_copy(), **self._buckets())
 
     # ------------------------------------------------------------------ io
     def to_json(self) -> str:
         return json.dumps({"name": self.name, "players": self.players,
                            "goalies": self.goalies, "teams": self.teams,
-                           "league": self.league, "notes": self.notes},
+                           "league": self.league, "notes": self.notes,
+                           "lines": self.lines},
                           indent=1, sort_keys=True, default=str)
 
     @classmethod
     def from_json(cls, text: str) -> "Scenario":
         d = json.loads(text) if text.strip() else {}
+        # `lines` is defaulted rather than required: every scenario written before the
+        # feature existed still loads, and still reads as whatever it was.
         return cls(name=d.get("name", "baseline"), players=d.get("players", {}),
                    goalies=d.get("goalies", {}), teams=d.get("teams", {}),
-                   league=d.get("league", {}), notes=d.get("notes", {}))
+                   league=d.get("league", {}), notes=d.get("notes", {}),
+                   lines={k: {kk: [int(p) for p in vv] for kk, vv in v.items()}
+                          for k, v in (d.get("lines") or {}).items()})
 
     def save(self, path: Path | str | None = None) -> Path:
         path = Path(path) if path else (C.SCENARIOS / f"{self.name}.json")
@@ -276,10 +332,17 @@ if __name__ == "__main__":
     sc = sc.set_player(8477492, goals=55)
     sc = sc.set_team("EDM", goals=290)
     sc = sc.patch_league(budget_tilt=0.5)
+    sc = sc.set_lines("EDM", {"L1": [8478402, 8477934, 8477492], "L2": [8479344]})
     print(sc.to_json())
     print("counts:", sc.count(), "digest:", sc.digest)
     back = Scenario.from_json(sc.to_json())
     assert back.digest == sc.digest, "round trip changed the scenario"
+    assert "L2" not in sc.lines["EDM"], "a one-man line should not be stored"
+    assert sc.set_player(8478402, gp=80).lines == sc.lines, "an edit dropped the lines"
+    assert sc.patch_league(budget_tilt=0.4).lines == sc.lines, "a knob dropped the lines"
+    assert sc.clear_lines("EDM").lines == {}
+    assert not sc.clear_lines("EDM").is_baseline, "other edits should survive"
+    assert Scenario.from_json('{"name":"old","players":{}}').lines == {}, "legacy load"
     assert sc.clear_all().is_baseline
     assert sc.patch_league(budget_tilt=C.BUDGET_TILT).league == {}, "default should not persist"
     print("round trip ok")

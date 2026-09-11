@@ -55,6 +55,13 @@ def _edit_list() -> None:
     for key, value in sorted(sc.league.items()):
         rows.append({"What": "League", "Who": "all teams", "Field": key, "Value": value,
                      "_bucket": "league", "_key": key})
+    # A lineup is one edit, not twelve: undoing it means dropping the whole card, because
+    # half a lineup is not a statement about anybody's linemates.
+    for team, units in sorted(sc.lines.items()):
+        named = sum(len(v) for v in units.values())
+        rows.append({"What": "Lines", "Who": team, "Field": "lineup",
+                     "Value": f"{len(units)} units, {named} players",
+                     "_bucket": "lines", "_key": team})
 
     if not rows:
         st.success("No edits. Every number in the app is the model's own opinion.")
@@ -78,6 +85,8 @@ def _edit_list() -> None:
                 sc2 = sc2.set_goalie(r["_key"], **{r["Field"]: None})
             elif r["_bucket"] == "teams":
                 sc2 = sc2.set_team(r["_key"], **{r["Field"]: None})
+            elif r["_bucket"] == "lines":
+                sc2 = sc2.clear_lines(r["_key"])
             else:
                 sc2 = sc2.patch_league(**{r["Field"]: None})
         core.commit(sc2, f"Undid {len(picked)} edit{'s' if len(picked) != 1 else ''}")
@@ -198,6 +207,7 @@ def page() -> None:
                 "Baseline model — no edits yet." if sc.is_baseline else
                 f"{core.edit_badge(n['edits'])} across {n['players']} skaters, "
                 f"{n['goalies']} goalies, {n['teams']} teams"
+                + (f", {n['lines']} lineups" if n["lines"] else "")
                 + (f" and {n['league']} league settings" if n["league"] else "") + ".")
 
     tab_list, tab_knobs, tab_files = st.tabs(["Edits", "League settings", "Save & share"])

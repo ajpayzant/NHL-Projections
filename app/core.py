@@ -90,6 +90,11 @@ def edit_team(team, **fields) -> None:
     commit(scenario().set_team(team, **fields))
 
 
+def edit_lines(team, units: dict | None, toast: str | None = None) -> None:
+    """Save (or, with `units=None`, clear) one team's lineup."""
+    commit(scenario().set_lines(team, units), toast)
+
+
 # --------------------------------------------------------------------------- #
 # the season in progress                                                      #
 # --------------------------------------------------------------------------- #
@@ -141,7 +146,8 @@ def window_label() -> str:
 # answer -- which is why these take a JSON string rather than a Scenario: Streamlit
 # hashes the arguments, so the argument has to BE the identity of the request.
 def _skater_key(sc: ov.Scenario) -> str:
-    return json.dumps({"players": sc.players, "teams": sc.teams, "league": sc.league},
+    return json.dumps({"players": sc.players, "teams": sc.teams, "league": sc.league,
+                       "lines": sc.lines},
                       sort_keys=True)
 
 
@@ -154,7 +160,7 @@ def _from_key(key: str) -> ov.Scenario:
     d = json.loads(key)
     return ov.Scenario(name="working", players=d.get("players", {}),
                        goalies=d.get("goalies", {}), teams=d.get("teams", {}),
-                       league=d.get("league", {}))
+                       league=d.get("league", {}), lines=d.get("lines", {}))
 
 
 # `stamp` is never read: it is in the signature so that new box scores invalidate the cache.
@@ -404,9 +410,11 @@ def scenario_bar() -> None:
         # already contains 24 games of hockey is a different claim from one that contains
         # none, and a reader who does not know which he is looking at cannot use either.
         st.caption(window_label())
+        bits = [f"{n['players']} skaters", f"{n['goalies']} goalies", f"{n['teams']} teams"]
+        if n["lines"]:
+            bits.append(f"{n['lines']} lineups")
         st.caption("Baseline model" if sc.is_baseline
-                   else f"{edit_badge(n['edits'])} · "
-                        f"{n['players']} skaters, {n['goalies']} goalies, {n['teams']} teams")
+                   else f"{edit_badge(n['edits'])} · " + ", ".join(bits))
         if not sc.is_baseline and st.button("Clear all edits", width="stretch"):
             commit(sc.clear_all(), "Back to the baseline model")
         if MULTIUSER:
