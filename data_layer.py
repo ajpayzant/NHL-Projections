@@ -382,6 +382,49 @@ def load_nhl_goalie_summary(refresh: bool = False) -> pd.DataFrame:
     return out
 
 
+def load_nhl_team_summary(refresh: bool = False) -> pd.DataFrame:
+    """Team season summaries across history: the WON-LOST record and the standings points.
+
+    MoneyPuck's team file carries every shot, hit and expected goal a team was involved in
+    and no record whatsoever -- it is a shot-quality source, so wins simply are not in it.
+    A record is the first thing anybody checks a team projection against ("they were 43-30-9
+    and you have them worse"), so it comes from here: one request per season, 32 rows each,
+    keyed by `teamId` and translated to the three-letter code the rest of the project uses.
+    """
+    cache = C.DATA_RAW / "nhl_team_summary.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+
+    codes = load_nhl_teams(refresh=refresh).set_index("id")["triCode"].to_dict()
+    frames = []
+    for yr in C.HISTORY_SEASONS:
+        try:
+            rows = _nhl_paged(C.NHL_TEAM_SUMMARY, yr)
+        except requests.HTTPError as e:
+            print(f"  [skip] team summary {yr}: {e}")
+            continue
+        df = pd.DataFrame(rows)
+        df["mp_season_year"] = yr
+        df["team"] = df["teamId"].map(codes)
+        frames.append(df)
+        print(f"  team summary {yr}: {len(df)} teams")
+        time.sleep(C.REQUEST_PAUSE)
+    out = pd.concat(frames, ignore_index=True)
+    out.to_parquet(cache, index=False)
+    return out
+
+
+def load_nhl_teams(refresh: bool = False) -> pd.DataFrame:
+    """Every franchise the API knows, current and defunct: id, full name, three-letter code."""
+    cache = C.DATA_RAW / "nhl_teams.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    rows = _get(C.NHL_TEAM_LIST).json().get("data", [])
+    out = pd.DataFrame(rows)
+    out.to_parquet(cache, index=False)
+    return out
+
+
 def load_nhl_goalie_bios(refresh: bool = False) -> pd.DataFrame:
     """Goalie bios (birthDate, draft position) across history seasons.
 

@@ -29,6 +29,11 @@ NHL_SKATER_BIOS = "https://api.nhle.com/stats/rest/en/skater/bios"
 NHL_GOALIE_SUMMARY = "https://api.nhle.com/stats/rest/en/goalie/summary"
 NHL_GOALIE_BIOS = "https://api.nhle.com/stats/rest/en/goalie/bios"
 NHL_SKATER_SUMMARY = "https://api.nhle.com/stats/rest/en/skater/summary"
+# Team season summaries: the one place a WON-LOST record lives. MoneyPuck's team file has
+# every shot and expected goal a team took and no wins, losses or standings points at all,
+# because it is a shot-quality source and not a standings one.
+NHL_TEAM_SUMMARY = "https://api.nhle.com/stats/rest/en/team/summary"
+NHL_TEAM_LIST = "https://api.nhle.com/stats/rest/en/team"
 
 # api-web endpoints for current-season structural data (rosters, schedule).
 NHL_ROSTER = "https://api-web.nhle.com/v1/roster/{team}/{season_id}"

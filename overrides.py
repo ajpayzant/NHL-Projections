@@ -45,7 +45,13 @@ import config as C
 
 # Per-player fields that feed the model. Editing one of these re-runs the arithmetic
 # downstream of it, which is the point: they are causes, not results.
-INPUT_FIELDS = ("gp", "toi_per_gp", "pp_toi_per_gp")
+#
+# `gp_low`/`gp_high` are one edit in two fields: a games-played RANGE. They fix the same
+# claim a bare `gp` does (the midpoint) and additionally state how sure the reader is,
+# which a single number cannot -- "72 to 80" and "76" are different beliefs, and games
+# played is the largest single source of season-total error, so the difference is worth
+# being able to say. See `project_skaters._apply_input_edits`.
+INPUT_FIELDS = ("gp", "gp_low", "gp_high", "toi_per_gp", "pp_toi_per_gp")
 RATE_PREFIX = "rate_"
 
 # Season totals that can be stated outright. Stating one locks it: it is taken out of

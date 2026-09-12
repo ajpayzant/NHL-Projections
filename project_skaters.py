@@ -439,6 +439,10 @@ def _rookie_rows(roster: pd.DataFrame, known: set, pos_means: dict,
 # --------------------------------------------------------------------------- #
 def _init_edit_cols(out: pd.DataFrame) -> None:
     out["edited"] = False
+    # A stated games-played RANGE, as the standard deviation it implies. NaN is "nobody
+    # said", which is the normal case and leaves the model's own reliability-scaled width
+    # in charge; see `_apply_input_edits`.
+    out["stated_gp_sigma"] = np.nan
     for col in ("gp", "toi", "pp_toi", "sh_toi", *COUNT_STATS):
         out[f"lock_{col}"] = False
         if col in COUNT_STATS:
@@ -542,6 +546,25 @@ def _apply_input_edits(out: pd.DataFrame, sc: ov.Scenario | None,
             out.at[i, "lock_gp"] = True
             # A stated status is certain, so it earns the tight interval.
             out.at[i, "gp_reliability"] = 1.0
+        # A stated RANGE, which is what a reader usually actually believes: "72 to 80",
+        # not "76". It fixes the same claim as a `gp` edit -- the midpoint -- but it also
+        # states the WIDTH, and the width is the whole reason to offer it. A bare `gp`
+        # edit is read as certainty and collapses the games band to nothing, which is
+        # right for "he is out for the year" and wrong for "about 76": it hands the season
+        # totals a confidence the reader never claimed. So the half-width is turned back
+        # into a standard deviation, and into the availability reliability that implies,
+        # which is the same dial the model's own widths are drawn on -- so a wide range
+        # widens the points and goals bands too, instead of only the games one.
+        if "gp_low" in edits or "gp_high" in edits:
+            lo = float(np.clip(edits.get("gp_low", edits.get("gp_high")), 0, C.MAX_GP))
+            hi = float(np.clip(edits.get("gp_high", edits.get("gp_low")), 0, C.MAX_GP))
+            lo, hi = min(lo, hi), max(lo, hi)
+            out.at[i, "claim_gp"] = (lo + hi) / 2.0
+            out.at[i, "lock_gp"] = True
+            sigma = (hi - lo) / (2.0 * _PI_Z)
+            out.at[i, "stated_gp_sigma"] = sigma
+            out.at[i, "gp_reliability"] = float(
+                np.clip((GP_SIGMA_LO - sigma) / (GP_SIGMA_LO - GP_SIGMA_HI), 0.0, 1.0))
         if "toi_per_gp" in edits:
             out.at[i, "claim_toi_per_gp"] = float(max(edits["toi_per_gp"], 0.0))
             out.at[i, "lock_toi"] = True
@@ -903,8 +926,15 @@ PI_FLOOR = {"points": 4.0, "goals": 2.0, "assists": 3.0, "shots": 15.0,
             "pim": 6.0, "faceoffs_won": 15.0, "ixg": 2.0}
 _PI_Z = 1.2816     # 80% central interval
 
+# Measured standard deviation of actual games played, at the two ends of the availability
+# reliability score: ~25 games for an injury-prone or thin-history skater, ~13 for a
+# durable one. Named because the relationship is read in both directions -- forwards to
+# draw a band, and backwards in `_apply_input_edits` to turn a range a reader states into
+# the reliability it implies.
+GP_SIGMA_LO, GP_SIGMA_HI = 25.0, 13.0
 
-def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> None:
+
+def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> pd.DataFrame:
     """p10/p90 for every stat, plus games played, right-skewed and non-negative.
 
     Two changes from the symmetric normal band this used to draw. First, season counting
@@ -915,8 +945,14 @@ def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> None:
     right way and cannot go negative. Second, games played gets its own interval: it is
     the largest single source of season-total error, and publishing a points range while
     hiding the availability range behind it was the wrong way round.
+
+    Returns the frame rather than writing into the one it was given: this adds two dozen
+    columns to a frame that already has several hundred, and inserting them one at a time is
+    what pandas warns about -- once per column, on every projection, which is once per edit
+    in the app.
     """
     rel = out["gp_reliability"].fillna(0.3) if "gp_reliability" in out else 0.3
+    block: dict[str, np.ndarray] = {}
     for stat, (c_lo, c_hi) in PI_COEFS.items():
         col = f"proj_{stat}"
         if col not in out:
@@ -930,8 +966,8 @@ def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> None:
         median = safe / np.exp(s2 / 2.0)            # preserve the mean
         lo = np.where(mean > 0, median * np.exp(-_PI_Z * s), 0.0)
         hi = np.where(mean > 0, median * np.exp(+_PI_Z * s), 0.0)
-        out[f"{stat}_p10"] = np.round(np.maximum(lo, 0.0), 1)
-        out[f"{stat}_p90"] = np.round(hi, 1)
+        block[f"{stat}_p10"] = np.round(np.maximum(lo, 0.0), 1)
+        block[f"{stat}_p90"] = np.round(hi, 1)
 
     # Games played: measured actual-GP std is ~13 for durable skaters and ~25 for
     # injury-prone ones, so the width is interpolated on the same reliability score. In
@@ -941,12 +977,64 @@ def _add_prediction_intervals(out: pd.DataFrame, gp_cap=None) -> None:
     cap = np.full(len(out), float(C.MAX_GP)) if gp_cap is None \
         else np.broadcast_to(np.asarray(gp_cap, dtype=float), (len(out),)).astype(float)
     gp = out["proj_gp"].to_numpy(dtype=float)
-    gp_sigma = (25.0 - 12.0 * rel).to_numpy(dtype=float) * np.sqrt(
-        np.clip(cap / float(C.MAX_GP), 0.0, 1.0))
+    shrink = np.sqrt(np.clip(cap / float(C.MAX_GP), 0.0, 1.0))
+    gp_sigma = (GP_SIGMA_LO - (GP_SIGMA_LO - GP_SIGMA_HI) * rel).to_numpy(dtype=float) * shrink
     locked = out["lock_gp"].to_numpy(dtype=bool) if "lock_gp" in out else np.zeros(len(out), bool)
     gp_sigma = np.where(locked, 0.0, gp_sigma)
-    out["gp_p10"] = np.round(np.clip(gp - _PI_Z * gp_sigma, 0, cap), 1)
-    out["gp_p90"] = np.round(np.clip(gp + _PI_Z * gp_sigma, 0, cap), 1)
+    # A stated range overrides both: it is neither the model's width nor the zero width a
+    # bare lock earns, it is the width the reader gave. Shrunk by the same window factor,
+    # so a season-long range said in October narrows as the games are banked rather than
+    # claiming the same uncertainty over the twelve that are left.
+    if "stated_gp_sigma" in out:
+        said = out["stated_gp_sigma"].to_numpy(dtype=float)
+        gp_sigma = np.where(np.isfinite(said), said * shrink, gp_sigma)
+    block["gp_p10"] = np.round(np.clip(gp - _PI_Z * gp_sigma, 0, cap), 1)
+    block["gp_p90"] = np.round(np.clip(gp + _PI_Z * gp_sigma, 0, cap), 1)
+    return pd.concat([out, pd.DataFrame(block, index=out.index)], axis=1)
+
+
+# --------------------------------------------------------------------------- #
+# realised rates                                                              #
+# --------------------------------------------------------------------------- #
+# The stats whose per-60 is worth publishing, and the clock each one is measured against
+# -- the same pairing the history tables use, so a projected PTS/60 and a 2024-25 PTS/60
+# are the same quantity and can be read down a column.
+PER60_STATS = ["goals", "primaryAssists", "secondaryAssists", "assists", "points",
+               "shots", "ixg", "blocks", "hits", "pim", "faceoffs_won",
+               "pp_points", "sh_points"]
+PER60_CLOCK = {"pp_points": "proj_pp_toi", "sh_points": "proj_sh_toi"}
+
+
+def _add_realised_rates(out: pd.DataFrame) -> pd.DataFrame:
+    """`per60_*`: the per-60 the PROJECTION works out to, which is a different number
+    from `rate_*` and is the one a reader should be shown.
+
+    `rate_*` is the input side: what the model thinks the player is, before his ice time
+    is known and before his team's budget has had anything to say. `points` has a
+    `rate_points` of its own -- blended straight from his points, rather than assembled
+    from goals and assists -- and it is kept only as `points_rate_check`, because the
+    projected points ARE goals plus assists. So `rate_points` is untouched by a G/60 edit,
+    untouched by an ice-time edit and untouched by settlement, and showing it as "PTS/60"
+    beside a projected points total was showing two numbers that do not describe each
+    other: raise a man's goal rate and his points moved while his PTS/60 sat still.
+
+    Divided out of the final totals, these move with every edit and every reallocation,
+    and `per60_points == per60_goals + per60_assists` by construction.
+    """
+    block = {}
+    for stat in PER60_STATS:
+        col = f"proj_{stat}"
+        if col not in out:
+            continue
+        clock = out[PER60_CLOCK.get(stat, "proj_toi")].to_numpy(dtype=float)
+        val = out[col].to_numpy(dtype=float)
+        # No ice time is no rate rather than a zero rate: a healthy scratch has not been
+        # measured, and calling that 0.00 PTS/60 states something about him that is false.
+        block[f"per60_{stat}"] = np.round(
+            np.divide(60.0 * val, clock, out=np.full(len(out), np.nan), where=clock > 0), 3)
+    # One concat rather than thirteen inserts: by here the frame has several hundred
+    # columns and inserting into it one at a time is what pandas warns about.
+    return pd.concat([out, pd.DataFrame(block, index=out.index)], axis=1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1102,7 +1190,7 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
                                       tb["toi_min"].to_dict())
             print(report.round(3).to_string())
 
-    _add_prediction_intervals(out, gp_cap=window)
+    out = _add_prediction_intervals(out, gp_cap=window)
     if use_live:
         # Everything above this line is the REST of the season. Add what is banked and every
         # column in the frame means the same thing it meant preseason -- a full-season number
@@ -1113,6 +1201,10 @@ def project_skaters(scenario: ov.Scenario | None = None, verbose: bool = False,
         # The fold inserts three columns per stat one at a time, which leaves the frame
         # badly fragmented; one copy here is cheaper than every later access paying for it.
         out = out.copy()
+
+    # After the fold, so the published per-60 is measured over the same season the totals
+    # describe: banked games included, not the rest-of-season part on its own.
+    out = _add_realised_rates(out)
 
     for col in out.columns:
         if col.startswith(("proj_", "claim_", "unc_", "rate_")) and \

@@ -539,6 +539,12 @@ def _record_coverage(out: pd.DataFrame, gb: pd.DataFrame) -> None:
 # a flat additive std of 0.0151 gives ~79% coverage. p10/p90 (80% band) matches skaters.
 PI_WINS_COEF = 2.2
 PI_SVPCT_STD = 0.0151
+# Shutouts get their own coefficient rather than borrowing the wins one, because they are a
+# much rarer event and the wins width is more than twice too wide for them. Measured on 1,056
+# goalie-seasons of 15+ starts (league rate 0.061 shutouts a start): residual std / sqrt of
+# expected is 0.93 at 15-25 starts, 1.04 in the middle and 1.12 for a workhorse. 1.05 puts
+# the band on a 3-shutout projection at roughly 1 to 5, which is what those seasons did.
+PI_SHUTOUT_COEF = 1.05
 _PI_Z = 1.2816  # 80% central interval
 
 
@@ -566,6 +572,11 @@ def _add_prediction_intervals(out: pd.DataFrame, window: float | None = None) ->
 
     band("proj_wins", PI_WINS_COEF, 2.0, "lock_wins")
     band("proj_saves", PI_WINS_COEF, 100.0)
+    # Shutouts on the same count footing, at their own measured width. The floor of 1 matters
+    # more here than anywhere else: the projection is often below 2, and without it the band
+    # on a 1.4-shutout season collapses toward nothing, which claims a certainty about what
+    # is close to a coin flip.
+    band("proj_shutouts", PI_SHUTOUT_COEF, 1.0, "lock_shutouts")
 
     # Starts get the measured quantile table instead of a shape (C.GOALIE_START_BAND):
     # a backup's season is bimodal and no parametric band can be honest about it.

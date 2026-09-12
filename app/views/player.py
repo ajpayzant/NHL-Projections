@@ -164,22 +164,87 @@ def _skater(row: pd.Series, base: pd.DataFrame) -> None:
     metrics = [("Games", "proj_gp", 0), ("TOI/GP", "proj_toi_per_gp", 1),
                ("Goals", "proj_goals", 1), ("Assists", "proj_assists", 1),
                ("Points", "proj_points", 1), ("Shots", "proj_shots", 0),
-               ("PTS/60", "rate_points", 2)]
+               # The projection's OWN points per 60, not the model's `rate_points` input.
+               # They are different numbers and only this one describes what is on screen
+               # beside it: it is the projected points divided by the projected ice time,
+               # so it moves with every rate edit, every ice-time edit and every
+               # reallocation, and it equals G/60 plus A/60 by construction.
+               ("PTS/60", "per60_points", 2)]
     for col, (label, key, nd) in zip(st.columns(len(metrics)), metrics):
         col.metric(label, core.num(row[key], nd),
                    delta=_delta(row, b, key, max(nd, 1)))
 
-    st.caption(f"Points {core.band(row['points_p10'], row['points_p90'])} "
-               f"floor to ceiling · games {core.band(row['gp_p10'], row['gp_p90'])}")
-
-    tab_hist, tab_rate, tab_how = st.tabs(
-        ["Prior seasons", "Ratings", "How the projection is built"])
+    tab_range, tab_hist, tab_rate, tab_how = st.tabs(
+        ["Floor and ceiling", "Prior seasons", "Ratings",
+         "How the projection is built"])
+    with tab_range:
+        _skater_range(row, b)
     with tab_hist:
         _skater_history(pid, row)
     with tab_rate:
         _skater_rate_form(row, b, edits)
     with tab_how:
         _skater_provenance(row)
+
+
+# The stats worth a range, and how many decimals the range is worth quoting to. Games
+# played leads, because it is the largest single source of season-total error and every
+# other band on the list is partly a restatement of it.
+RANGE_ROWS = [("Games played", "gp", 0), ("Points", "points", 0), ("Goals", "goals", 0),
+              ("Assists", "assists", 0), ("Shots", "shots", 0),
+              ("PP points", "pp_points", 0), ("Blocks", "blocks", 0),
+              ("Hits", "hits", 0), ("PIM", "pim", 0)]
+
+
+def _skater_range(row: pd.Series, b: pd.Series | None) -> None:
+    """The 80% band around every headline total, laid out rather than mentioned.
+
+    A projection is a mean, and a mean on its own invites being read as a prediction. The
+    range is the honest object: an 80% central interval, so one season in ten finishes
+    below the floor and one in ten above the ceiling. Both tails matter and are shown --
+    quoting only the upside is how a projection becomes a sales pitch.
+    """
+    st.markdown("**An 80% range.** One season in ten finishes below the floor, one in ten "
+                "above the ceiling. So the floor is not a worst case and the ceiling is "
+                "not a best case: they are the edges of what would be unremarkable.")
+    rows = []
+    for label, stat, nd in RANGE_ROWS:
+        proj = row.get("proj_gp" if stat == "gp" else f"proj_{stat}")
+        lo, hi = row.get(f"{stat}_p10"), row.get(f"{stat}_p90")
+        if proj is None or lo is None or pd.isna(proj) or pd.isna(lo):
+            continue
+        per_gp = float(proj) / float(row["proj_gp"]) if float(row["proj_gp"]) > 0 else None
+        rows.append({"Stat": label, "Floor": float(lo), "Projection": float(proj),
+                     "Ceiling": float(hi), "Spread": float(hi) - float(lo),
+                     "Per game": None if stat == "gp" else per_gp})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+        "Floor": st.column_config.NumberColumn("Floor (p10)", format="%.0f"),
+        "Projection": st.column_config.NumberColumn(format="%.1f"),
+        "Ceiling": st.column_config.NumberColumn("Ceiling (p90)", format="%.0f"),
+        "Spread": st.column_config.NumberColumn("Ceiling − floor", format="%.0f"),
+        "Per game": st.column_config.NumberColumn(format="%.2f")})
+
+    gp_lo, gp_hi = float(row["gp_p10"]), float(row["gp_p90"])
+    said = row.get("stated_gp_sigma")
+    stated = said is not None and pd.notna(said)
+    bits = [f"Games {core.band(gp_lo, gp_hi)}"]
+    if b is not None and "points_p90" in b and pd.notna(b["points_p90"]):
+        bits.append(f"the model's own points range was "
+                    f"{core.band(b['points_p10'], b['points_p90'])}")
+    st.caption(" · ".join(bits))
+    if stated:
+        st.caption("This games range was stated on the Ratings tab, so it is the reader's "
+                   "range and not the model's — and the width of it is carried through to "
+                   "every other band above, because a season whose length is uncertain "
+                   "has uncertain totals.")
+    else:
+        st.caption(
+            f"The width comes from how predictable his availability is (reliability "
+            f"{row['gp_reliability']:.2f} of 1) and from the size of the total itself: "
+            f"a 30-goal projection has a wider band than a 10-goal one, and further to "
+            f"climb than to fall, which is why the ceiling sits further from the "
+            f"projection than the floor does. State a range yourself on the Ratings tab "
+            f"if you disagree about how sure this is.")
 
 
 def _skater_history(pid: int, row: pd.Series) -> None:
@@ -195,38 +260,52 @@ def _skater_history(pid: int, row: pd.Series) -> None:
     how = st.radio("How", ["Totals", "Per 60"], horizontal=True,
                    label_visibility="collapsed", key=f"hist_how_{pid}")
     if how == "Totals":
-        _table(h, HIST_TOTALS)
-        st.caption("What he actually did. Ice time is total minutes; PPP and SHP are "
-                   "power-play and short-handed points.")
+        # The projection leads the column here for the same reason it does in the per-60
+        # view: a season total means something only against the seasons a reader remembers.
+        totals = {"season": f"{core.SEASON_LABEL} model", "team": row["team"],
+                  "gp": float(row["proj_gp"]), "toi_min": float(row["proj_toi"]),
+                  "toi_per_gp": float(row["proj_toi_per_gp"]),
+                  "pp_toi_per_gp": float(row["proj_pp_toi_per_gp"]),
+                  **{stat: row.get(f"proj_{stat}")
+                     for stat in ("goals", "assists", "points", "shots", "ixg",
+                                  "pp_points", "sh_points", "blocks", "hits", "pim",
+                                  "faceoffs_won")}}
+        _table(pd.concat([pd.DataFrame([totals]), h], ignore_index=True), HIST_TOTALS)
+        st.caption(f"What he actually did, under the {core.SEASON_LABEL} projection. Ice "
+                   "time is total minutes; PPP and SHP are power-play and short-handed "
+                   "points. Seasons of different lengths are on the Per 60 view.")
     else:
         # The model's own view is appended as a row rather than described in prose: the
         # only useful question about a rate is what it is next to the others.
+        #
+        # Every rate in it is the PROJECTION divided by the projected ice time, not the
+        # `rate_*` input it was built from. That is what makes the row comparable with the
+        # seasons under it, which are also totals divided by minutes played -- and it is
+        # what keeps the row internally consistent: `rate_points` is blended separately
+        # from goals and assists, so a row mixing the two showed a PTS/60 that was not
+        # G/60 plus A/60.
         model = {"season": f"{core.SEASON_LABEL} model", "team": row["team"],
                  "gp": float(row["proj_gp"]), "toi_min": float(row["proj_toi"]),
                  "toi_per_gp": float(row["proj_toi_per_gp"]),
                  "pp_toi_per_gp": float(row["proj_pp_toi_per_gp"]),
-                 "rate_goals": float(row["rate_goals"]),
-                 "rate_assists": float(row["rate_primaryAssists"]
-                                       + row["rate_secondaryAssists"]),
-                 "rate_points": float(row["rate_points"]),
-                 "rate_shots": float(row["rate_shots"]),
-                 "rate_ixg": float(row["rate_ixg"]),
-                 "rate_pp_points": float(row["rate_pp_points"]),
-                 "rate_sh_points": float(row["rate_sh_points"]),
-                 "rate_blocks": float(row["rate_blocks"]),
-                 "rate_hits": float(row["rate_hits"]),
-                 "rate_pim": float(row["rate_pim"]),
-                 "rate_faceoffs_won": float(row["rate_faceoffs_won"])}
+                 **{f"rate_{stat}": row.get(f"per60_{stat}")
+                    for stat in ("goals", "assists", "points", "shots", "ixg",
+                                 "pp_points", "sh_points", "blocks", "hits", "pim",
+                                 "faceoffs_won")}}
         _table(pd.concat([pd.DataFrame([model]), h], ignore_index=True), HIST_RATES)
         st.caption(
             "Per 60 minutes of ice time, except PPP and SHP which are per 60 minutes of "
             "power play and short handed — a player's points per 60 OF POWER PLAY is a "
             "skill that travels with him, where his PP points per 60 of total ice time "
             "is mostly a statement about how much power-play time his last coach gave "
-            "him. The top row is what the model carries into "
-            f"{core.SEASON_LABEL}: a recency-weighted, age-adjusted blend of these "
-            "seasons, regressed toward players of the same position and usage by an "
-            "amount that depends on how many minutes there are to learn from.")
+            f"him. The top row is the {core.SEASON_LABEL} projection put back into the "
+            "same units — his projected totals divided by his projected minutes, after "
+            "his team's budget has settled — so it can be read straight down the column "
+            "against seasons he actually played. Underneath it is a recency-weighted, "
+            "age-adjusted blend of those seasons, regressed toward players of the same "
+            "position and usage by an amount that depends on how many minutes there are "
+            "to learn from; the Ratings tab shows that blend before settlement, which is "
+            "the number to edit.")
 
     st.divider()
     _spark(h, pid)
@@ -275,6 +354,44 @@ def _skater_rate_form(row: pd.Series, b: pd.Series | None, edits: dict) -> None:
     pp = c3.number_input("PP TOI per game", 0.0, 8.0,
                          float(row["proj_pp_toi_per_gp"]), 0.25, key=f"rpp_{pid}")
 
+    # A range instead of a number, for the one input where a reader almost never believes
+    # a point estimate. Stating 82 games says he plays all of them and nothing can go
+    # wrong; stating 70 to 82 says the same expectation with the doubt left in, and the
+    # doubt is carried into the points and goals bands as well as the games one.
+    use_range = st.checkbox(
+        "State a games-played range instead", value="gp_low" in edits,
+        key=f"rgpr_{pid}",
+        help="Games played is the largest single source of season-total error, so it is "
+             "the input where saying how sure you are matters most.")
+    lo = hi = None
+    if use_range:
+        d1, d2, d3 = st.columns([1, 1, 2])
+        cur_lo = float(edits.get("gp_low", max(row["gp_p10"], 0.0)))
+        cur_hi = float(edits.get("gp_high", row["gp_p90"]))
+        lo = d1.number_input("Games, floor", 0.0, float(core.C.MAX_GP), cur_lo, 1.0,
+                             key=f"rgplo_{pid}")
+        hi = d2.number_input("Games, ceiling", 0.0, float(core.C.MAX_GP), cur_hi, 1.0,
+                             key=f"rgphi_{pid}")
+        d3.caption(f"An 80% range: the projection becomes the midpoint "
+                   f"({(min(lo, hi) + max(lo, hi)) / 2:.0f} games) and the width sets how "
+                   f"wide every other band on the Floor and ceiling tab is. The games box "
+                   f"above is ignored while this is ticked.")
+
+    st.markdown("**Team.** Where he plays, which is a structural edit rather than a "
+                "rating: it moves him into the destination team's lineup and its budget, "
+                "and off the one he was on.")
+    t1, t2 = st.columns([1, 2])
+    teams = core.team_options(core.skaters()[0])
+    cur_team = str(row["team"])
+    idx = teams.index(cur_team) + 1 if cur_team in teams else 0
+    team = t1.selectbox("Team", ["(not on a roster)"] + teams, index=idx, key=f"rtm_{pid}")
+    t2.caption("Signing a free agent or moving a player takes effect everywhere at once: "
+               "he becomes selectable in the destination team's lines, his production "
+               "counts against that team's budget, and the team he left has his minutes "
+               "back to give to somebody else. Putting him back to *(not on a roster)* "
+               "takes him off every team budget without deleting anything else you have "
+               "said about him.")
+
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("Save ratings", type="primary", key=f"rsave_{pid}"):
         patch: dict = {}
@@ -282,12 +399,25 @@ def _skater_rate_form(row: pd.Series, b: pd.Series | None, edits: dict) -> None:
             field = f"rate_{stat}"
             if abs(float(v) - float(row[field])) >= 5e-4:
                 patch[field] = float(v)
-        for value, field, now in [(gp, "gp", row["proj_gp"]),
-                                  (toi, "toi_per_gp", row["proj_toi_per_gp"]),
+        for value, field, now in [(toi, "toi_per_gp", row["proj_toi_per_gp"]),
                                   (pp, "pp_toi_per_gp", row["proj_pp_toi_per_gp"])]:
             if abs(float(value) - float(now)) >= 0.01:
                 patch[field] = float(value)
-        if patch:
+        # The two ways of stating availability are exclusive, and switching between them
+        # clears the other, or a stale `gp` lock would silently outrank the new range.
+        if use_range:
+            patch.update(gp=None, gp_low=float(min(lo, hi)), gp_high=float(max(lo, hi)))
+        else:
+            patch.update(gp_low=None, gp_high=None)
+            if abs(float(gp) - float(row["proj_gp"])) >= 0.01:
+                patch["gp"] = float(gp)
+        want_team = None if team.startswith("(") else team
+        if want_team != (cur_team if cur_team in teams else None):
+            patch["team"] = want_team or cur_team
+            patch["on_roster"] = want_team is not None
+        # `None` means "forget this edit", so a patch of nothing but Nones over fields
+        # that were never set is not a change and must not read as one.
+        if any(v is not None or k in edits for k, v in patch.items()):
             core.edit_player(pid, **patch)
         else:
             st.info("Nothing changed.")
@@ -366,14 +496,69 @@ def _goalie(row: pd.Series, base: pd.DataFrame) -> None:
                f"ceiling · wins {core.band(row['wins_p10'], row['wins_p90'])} · SV% "
                f"{core.sv(row['save_pct_p10'])} to {core.sv(row['save_pct_p90'])}")
 
-    tab_hist, tab_rate, tab_how = st.tabs(
-        ["Prior seasons", "Ratings", "How the projection is built"])
+    tab_band, tab_hist, tab_rate, tab_how = st.tabs(
+        ["Floor and ceiling", "Prior seasons", "Ratings",
+         "How the projection is built"])
+    with tab_band:
+        _goalie_range(row, b)
     with tab_hist:
         _goalie_history(pid, row)
     with tab_rate:
         _goalie_rate_form(row, b, edits)
     with tab_how:
         _goalie_provenance(row)
+
+
+def _goalie_range(row: pd.Series, b: pd.Series | None) -> None:
+    """The same 80% band for a goalie, where the workload question is the whole question.
+
+    Starts are the one band here that is NOT parametric: a backup's season is bimodal --
+    either the starter stays healthy or it isn't a backup season at all -- and the band comes
+    from a measured quantile table instead of a shape. Save percentage is the opposite case:
+    a bounded rate with a symmetric band, and the rate a reader should argue with rather than
+    the totals it produces.
+    """
+    st.markdown("**An 80% range.** One season in ten finishes below the floor, one in ten "
+                "above the ceiling. For a goalie the width is mostly a workload question: "
+                "how many starts he actually gets is a bigger unknown than how well he "
+                "stops the puck.")
+    rows = []
+    for label, stat, nd in [("Starts", "starts", 1), ("Wins", "wins", 1),
+                            ("Saves", "saves", 0), ("Shutouts", "shutouts", 1)]:
+        proj, lo, hi = (row.get(f"proj_{stat}"), row.get(f"{stat}_p10"),
+                        row.get(f"{stat}_p90"))
+        if proj is None or lo is None or pd.isna(proj) or pd.isna(lo):
+            continue
+        per = float(proj) / float(row["proj_starts"]) if float(row["proj_starts"]) > 0 \
+            else None
+        rows.append({"Stat": label, "Floor": float(lo), "Projection": float(proj),
+                     "Ceiling": float(hi), "Spread": float(hi) - float(lo),
+                     "Per start": None if stat == "starts" else per})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={
+        "Floor": st.column_config.NumberColumn("Floor (p10)", format="%.0f"),
+        "Projection": st.column_config.NumberColumn(format="%.1f"),
+        "Ceiling": st.column_config.NumberColumn("Ceiling (p90)", format="%.0f"),
+        "Spread": st.column_config.NumberColumn("Ceiling − floor", format="%.0f"),
+        "Per start": st.column_config.NumberColumn(format="%.2f")})
+
+    # The two rates, in their own units: a save percentage read to four places and a GAA to
+    # two do not belong in a column of counting totals rounded to whole numbers.
+    st.dataframe(pd.DataFrame([
+        {"Rate": "Save percentage", "Floor": core.sv(row["save_pct_p10"]),
+         "Projection": core.sv(row["proj_save_pct"]),
+         "Ceiling": core.sv(row["save_pct_p90"])},
+        {"Rate": "GAA", "Floor": f"{float(row['gaa_p10']):.2f}",
+         "Projection": f"{float(row['proj_gaa']):.2f}",
+         "Ceiling": f"{float(row['gaa_p90']):.2f}"}]),
+        hide_index=True, width="stretch")
+    st.caption("The GAA floor is the GOOD end: it is drawn from the save-percentage ceiling "
+               "at the shots he is projected to face, so the two rows can never tell "
+               "different stories. State his starts or his save percentage on the Ratings "
+               "tab and the band around the stated number closes to nothing — an outright "
+               "statement is not uncertain.")
+    if b is not None and "wins_p90" in b and pd.notna(b["wins_p90"]):
+        st.caption(f"The model's own wins range was "
+                   f"{core.band(b['wins_p10'], b['wins_p90'], 1)}.")
 
 
 def _goalie_history(pid: int, row: pd.Series) -> None:
@@ -386,9 +571,15 @@ def _goalie_history(pid: int, row: pd.Series) -> None:
     how = st.radio("How", ["Totals", "Per 60 and per start"], horizontal=True,
                    label_visibility="collapsed", key=f"ghist_how_{pid}")
     if how == "Totals":
-        _table(h, G_HIST_TOTALS)
-        st.caption("A traded goalie's row lists every team he played for that season; "
-                   "the source does not split the totals.")
+        proj = {"season": f"{core.SEASON_LABEL} model", "team": row["team"],
+                "save_pct": float(row["proj_save_pct"]), "gaa": float(row["proj_gaa"]),
+                **{stat: row.get(f"proj_{stat}")
+                   for stat in ("gp", "starts", "wins", "losses", "otl", "minutes",
+                                "shots_against", "saves", "goals_against", "shutouts")}}
+        _table(pd.concat([pd.DataFrame([proj]), h], ignore_index=True), G_HIST_TOTALS)
+        st.caption(f"The {core.SEASON_LABEL} projection on top, then what he actually did. "
+                   "A traded goalie's row lists every team he played for that season; the "
+                   "source does not split the totals.")
     else:
         model = {"season": f"{core.SEASON_LABEL} model", "team": row["team"],
                  "starts": float(row["proj_starts"]),

@@ -101,17 +101,21 @@ def _gist_write(gid: str, tok: str, fname: str, content: str | None) -> None:
 # the library                                                                 #
 # --------------------------------------------------------------------------- #
 def _meta(name: str, text: str) -> dict:
-    """Name, author and size of one saved scenario, for the list a reader picks from."""
+    """Name, author and size of one saved scenario, for the list a reader picks from.
+
+    The size is counted by `Scenario.count()` rather than by walking the JSON here, so
+    the number in the library matches the number in the sidebar. Counting it twice is
+    how a lineup-only scenario came to be listed as "0 edits" -- which reads as an empty
+    save and is the one thing that would stop somebody opening it.
+    """
     try:
-        d = json.loads(text)
+        sc = ov.Scenario.from_json(text)
     except (ValueError, TypeError):
         return {"name": name, "author": "?", "saved": "?", "edits": 0, "broken": True}
-    notes = d.get("notes") or {}
-    edits = sum(len(v) for k in ("players", "goalies", "teams")
-                for v in (d.get(k) or {}).values()) + len(d.get("league") or {})
+    notes = sc.notes or {}
     return {"name": name, "author": notes.get("author") or "-",
             "saved": (notes.get("saved_at") or "-")[:16].replace("T", " "),
-            "edits": edits, "broken": False}
+            "edits": sc.count()["edits"], "broken": False}
 
 
 def entries() -> list[dict]:
@@ -146,8 +150,13 @@ def save(sc: ov.Scenario, name: str, author: str = "") -> None:
     notes = dict(sc.notes)
     notes["author"] = (author or "anonymous").strip()[:60]
     notes["saved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Every bucket, `lines` included. Naming them one by one is what dropped the lineups
+    # on publish while the download button kept them, so the copy is asserted to be a copy
+    # rather than trusted: if a new bucket is added to Scenario, this fails loudly here
+    # instead of silently saving without it.
     copy = ov.Scenario(name=name, players=sc.players, goalies=sc.goalies, teams=sc.teams,
-                       league=sc.league, notes=notes)
+                       league=sc.league, notes=notes, lines=sc.lines)
+    assert copy.digest == sc.digest, "the published copy is not the scenario"
     g = _gist()
     if g:
         _gist_write(*g, f"{PREFIX}{name}.json", copy.to_json())

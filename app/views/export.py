@@ -26,10 +26,15 @@ SKATER_COLS = [
     ("proj_sh_points", "SHP", 8, "0.0"), ("proj_blocks", "BLK", 8, "0"),
     ("proj_hits", "HIT", 8, "0"), ("proj_pim", "PIM", 8, "0"),
     ("proj_faceoffs_won", "FOW", 8, "0"),
-    # The rates the projection is built from, so a reader can see the engine's view of the
-    # player and not just its arithmetic.
-    ("rate_points", "PTS/60", 9, "0.00"), ("rate_goals", "G/60", 8, "0.00"),
-    ("rate_shots", "SOG/60", 9, "0.00"), ("rate_ixg", "ixG/60", 9, "0.00"),
+    ("gp_p10", "GP floor", 10, "0"), ("gp_p90", "GP ceiling", 11, "0"),
+    # Two kinds of per-60, and the sheet says which is which. `per60_*` is the projection
+    # divided by the projected minutes -- it describes the totals to its left and moves with
+    # them. `rate_*` is the model's input rating for the player, before ice time and before
+    # his team's budget, which is the number to argue with rather than the one to read.
+    ("per60_points", "PTS/60", 9, "0.00"), ("per60_goals", "G/60", 8, "0.00"),
+    ("per60_shots", "SOG/60", 9, "0.00"), ("per60_ixg", "ixG/60", 9, "0.00"),
+    ("rate_goals", "Rated G/60", 11, "0.00"),
+    ("rate_shots", "Rated SOG/60", 13, "0.00"),
     ("edited", "Edited", 8, None),
 ]
 GOALIE_COLS = [
@@ -40,7 +45,8 @@ GOALIE_COLS = [
     ("wins_p10", "W floor", 9, "0"), ("wins_p90", "W ceiling", 10, "0"),
     ("proj_losses", "L", 7, "0.0"), ("proj_otl", "OTL", 7, "0.0"),
     ("proj_save_pct", "SV%", 8, "0.000"), ("proj_gaa", "GAA", 8, "0.00"),
-    ("proj_shutouts", "SO", 7, "0.0"), ("proj_saves", "SV", 8, "0"),
+    ("proj_shutouts", "SO", 7, "0.0"), ("shutouts_p10", "SO floor", 10, "0"),
+    ("shutouts_p90", "SO ceiling", 11, "0"), ("proj_saves", "SV", 8, "0"),
     ("proj_shots_against", "SA", 8, "0"), ("claim_start_share", "Start share", 12, "0.000"),
     ("rate_sa_per_60", "SA/60", 9, "0.00"), ("edited", "Edited", 8, None),
 ]

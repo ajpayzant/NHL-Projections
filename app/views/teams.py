@@ -139,7 +139,7 @@ def _team_page(team: str, sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
     gs = g[(g["team"] == team) & g["on_roster"]]
     b, gbb = tb.loc[team], (gb.loc[team] if team in gb.index else None)
 
-    m = st.columns(6)
+    m = st.columns(7)
     m[0].metric("Skaters listed", len(on))
     m[1].metric("Goalies listed", len(gs))
     m[2].metric("Roster covers", f"{float(b['toi_coverage']):.0%}",
@@ -147,6 +147,15 @@ def _team_page(team: str, sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
     m[3].metric("Goals", core.num(on["proj_goals"].sum(), 0))
     m[4].metric("Points", core.num(on["proj_points"].sum(), 0))
     m[5].metric("Wins", core.num(gs["proj_wins"].sum(), 1))
+    # Last season's record, up front. The projected wins beside it are the comparison a
+    # reader makes first, and making them look it up on another tab is how a projection
+    # gets read without the one number that anchors it.
+    last = core.team_history()
+    last = last[(last["team"] == team) & last["record"].notna()]
+    if not last.empty:
+        r = last.iloc[0]
+        m[6].metric(f"{int(r['season'])}-{str(int(r['season']) + 1)[-2:]} record",
+                    str(r["record"]), delta=f"{int(r['pts'])} pts", delta_color="off")
 
     tab_b, tab_r, tab_h, tab_v, tab_s, tab_e = st.tabs(
         ["Budget", "Roster", "Team history", "Roster review", "Schedule",
@@ -201,7 +210,9 @@ def _team_page(team: str, sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
             "TOI/GP": on["proj_toi_per_gp"], "PP/GP": on["proj_pp_toi_per_gp"],
             "G": on["proj_goals"], "A": on["proj_assists"], "PTS": on["proj_points"],
             "SOG": on["proj_shots"], "BLK": on["proj_blocks"], "HIT": on["proj_hits"],
-            "PTS/60": on["rate_points"], "Edited": on["edited"],
+            # The projection's own per-60, so it describes the PTS beside it and moves
+            # when an edit moves them. `rate_points` is the input rate and does not.
+            "PTS/60": on["per60_points"], "Edited": on["edited"],
         }).sort_values("PTS", ascending=False)
         st.dataframe(show, hide_index=True, width="stretch", height=380, column_config={
             "GP": st.column_config.NumberColumn(format="%.0f"),
@@ -228,6 +239,7 @@ def _team_page(team: str, sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
             "GAA": st.column_config.NumberColumn(format="%.2f")})
         st.caption("Open a single player on the Player dashboard to edit his ratings; "
                    "edit the whole team's totals in the last tab.")
+        _roster_moves(team, sk, g)
 
     with tab_h:
         _history_tab(team, b, gbb)
@@ -243,13 +255,152 @@ def _team_page(team: str, sk: pd.DataFrame, tb: pd.DataFrame, g: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
+# roster moves                                                                #
+# --------------------------------------------------------------------------- #
+def _move_label(row, team: str) -> str:
+    """One line for the picker: who he is, where he is now, and what he is worth.
+
+    The current situation is the whole point of the label. "Add Player X" is a decision a
+    reader cannot make without knowing whether X is a free agent, somebody's camp body or
+    another team's second-line centre -- the last of those takes a player OFF a rival, and
+    that has to be visible before the click rather than after it.
+    """
+    where = row["team"] if row["on_roster"] else core.roster_label(row)
+    got = row.get("proj_points")
+    if got is None or pd.isna(got):
+        got = row.get("proj_starts", np.nan)
+        worth = "-" if pd.isna(got) else f"{got:.0f} GS"
+    else:
+        worth = f"{got:.0f} PTS"
+    return f"{row['name']} · {row.get('position', 'G')} · {where} · {worth}"
+
+
+def _move_pool(df: pd.DataFrame, team: str, kind: str) -> dict:
+    """Label -> (kind, playerId) for everyone this team could add, likeliest first.
+
+    Three tiers, because a list of 1,800 names sorted only by projected points opens on
+    players who retired two years ago. What a reader is nearly always doing here is putting
+    back a body the camp cut dropped from THIS team, so those come first; then everyone else
+    without a team; then other teams' players, who are a deliberate raid and can be searched
+    for by name. Within each tier, best first.
+    """
+    sort = "proj_points" if "proj_points" in df.columns else "proj_starts"
+    cols = [c for c in ("playerId", "name", "position", "team", "on_roster", "camp",
+                        "camp_team", sort) if c in df.columns]
+    # Narrowed before the row walk: these frames carry several hundred columns and the
+    # picker needs eight of them, and this runs on every redraw of the page.
+    pool = df.loc[df["team"] != team, cols].copy()
+    if pool.empty:
+        return {}
+    ours = pool.get("camp_team", pd.Series("", index=pool.index)).fillna("") == team
+    pool["tier"] = np.where(ours, 0, np.where(pool["on_roster"], 2, 1))
+    pool = pool.sort_values(["tier", sort], ascending=[True, False])
+    return {_move_label(r, team): (kind, int(r["playerId"])) for _, r in pool.iterrows()}
+
+
+def _roster_moves(team: str, sk: pd.DataFrame, g: pd.DataFrame) -> None:
+    """Assign players to this team, or release them, without leaving the team page.
+
+    Both directions are one scenario edit per player, committed together, because signing
+    three forwards is one decision and redrawing the page between them would make a reader
+    watch the budget re-settle twice for no reason. A team edit is all it takes to make the
+    player selectable in this team's lines and counted in this team's budget -- the lineup
+    page pools on team, and settlement pools on `on_roster & team`.
+    """
+    with st.expander("Move players onto or off this roster"):
+        st.caption("Adding a player puts him on this team's budget and in its lineup pool. "
+                   "Releasing him makes him a free agent — his projection survives, it is "
+                   "just no longer part of any team's totals.")
+        add_pool = {**_move_pool(sk, team, "s"), **_move_pool(g, team, "g")}
+        # Skaters and goalies are listed together but edited through different buckets, so
+        # the kind travels with the pick rather than being guessed back out of the row.
+        drop_pool = {}
+        for df, kind in ((sk, "s"), (g, "g")):
+            here = df[(df["team"] == team) & df["on_roster"]]
+            if here.empty:
+                continue
+            sort = "proj_points" if "proj_points" in here.columns else "proj_starts"
+            for _, r in here.sort_values(sort, ascending=False).iterrows():
+                drop_pool[_move_label(r, team)] = (kind, int(r["playerId"]))
+
+        left, right = st.columns(2)
+        with left:
+            add = st.multiselect(f"Assign to {team}", list(add_pool),
+                                 key=f"add_{team}",
+                                 help="free agents, camp bodies and players currently on "
+                                      "another team")
+            if st.button("Assign", key=f"do_add_{team}", disabled=not add):
+                sc = core.scenario()
+                for label in add:
+                    kind, pid = add_pool[label]
+                    sc = (sc.set_player(pid, team=team, on_roster=True) if kind == "s"
+                          else sc.set_goalie(pid, team=team, on_roster=True))
+                core.commit(sc, f"{len(add)} added to {team}")
+        with right:
+            drop = st.multiselect(f"Release from {team}", list(drop_pool),
+                                  key=f"drop_{team}",
+                                  help="the projection is kept; the player just comes off "
+                                       "this team's budget")
+            if st.button("Release", key=f"do_drop_{team}", disabled=not drop):
+                sc = core.scenario()
+                for label in drop:
+                    kind, pid = drop_pool[label]
+                    sc = (sc.set_player(pid, on_roster=False, team=None) if kind == "s"
+                          else sc.set_goalie(pid, on_roster=False, team=None))
+                core.commit(sc, f"{len(drop)} released from {team}")
+
+        moved = _moved_here(team, sk, g)
+        if not moved.empty:
+            st.markdown("**Moved by hand**")
+            st.dataframe(moved, hide_index=True, width="stretch")
+
+
+def _moved_here(team: str, sk: pd.DataFrame, g: pd.DataFrame) -> pd.DataFrame:
+    """The roster moves in force, so a reader can see what he changed and undo it.
+
+    Read from the scenario rather than from the frames: a player assigned to the team he was
+    already on leaves no trace in the projection, and one released leaves the team entirely
+    and would not be found by looking at this roster.
+    """
+    sc = core.scenario()
+    rows = []
+    for df, bucket in ((sk, sc.players), (g, sc.goalies)):
+        if df.empty:
+            continue
+        cols = [c for c in ("name", "team", "on_roster", "camp", "camp_team", "target_age")
+                if c in df.columns]
+        by_id = df.set_index("playerId")[cols]
+        for pid_s, edits in bucket.items():
+            if "team" not in edits and "on_roster" not in edits:
+                continue
+            try:
+                row = by_id.loc[int(pid_s)]
+            except (KeyError, ValueError):
+                continue
+            was, now = edits.get("team"), row["team"]
+            if now != team and was != team:
+                continue
+            rows.append({"Player": row["name"],
+                         "Now": now if row["on_roster"] else core.roster_label(row),
+                         "Listed": bool(row["on_roster"])})
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------- #
 # team history                                                                #
 # --------------------------------------------------------------------------- #
-# (column, label, format). Per-game rather than per-season for everything that scales
-# with a schedule: this history spans a 48-game lockout year, two shortened Covid
-# seasons and an 84-game season ahead, so totals are not comparable and rates are.
-HIST_COLS = [
-    ("season_label", "Season", None), ("as_named", "As", None), ("gp", "GP", "%.0f"),
+# (column, label, format). Two views of the same seasons, because the two answer different
+# questions and neither is a substitute for the other. Per game is what can be compared
+# down a column -- this history spans a 48-game lockout year, two shortened Covid seasons
+# and an 84-game season ahead. Totals are what a reader actually remembers a team by, and
+# what a season-total budget on the other tabs is denominated in.
+#
+# The record leads both. It is the sentence a team gets stated in, and a goal budget argued
+# without one is being argued in a vacuum.
+HIST_HEAD = [("season_label", "Season", None), ("as_named", "As", None),
+             ("gp", "GP", "%.0f"), ("record", "Record", None), ("pts", "PTS", "%.0f"),
+             ("pts_pct", "P%", "%.3f")]
+HIST_COLS = HIST_HEAD + [
     ("gf_pg", "GF/GP", "%.2f"), ("ga_pg", "GA/GP", "%.2f"), ("gdiff_pg", "Diff", "%+.2f"),
     ("xgf_pg", "xGF/GP", "%.2f"), ("xga_pg", "xGA/GP", "%.2f"),
     ("xgdiff_pg", "xDiff", "%+.2f"), ("xg_share", "xG%", "%.3f"),
@@ -259,6 +410,16 @@ HIST_COLS = [
     ("hdf_pg", "HDC for", "%.1f"), ("hda_pg", "HDC vs", "%.1f"),
     ("hits_pg", "Hits/GP", "%.1f"), ("pim_pg", "PIM/GP", "%.1f"),
     ("fow_pct", "FO%", "%.3f"),
+]
+HIST_TOTAL_COLS = HIST_HEAD + [
+    ("gf", "GF", "%.0f"), ("ga", "GA", "%.0f"), ("gdiff", "Diff", "%+.0f"),
+    ("xgf", "xGF", "%.1f"), ("xga", "xGA", "%.1f"), ("xgdiff", "xDiff", "%+.1f"),
+    ("xg_share", "xG%", "%.3f"), ("corsi", "Corsi%", "%.3f"),
+    ("sf", "SF", "%.0f"), ("sa", "SA", "%.0f"), ("shoot_pct", "Shoot%", "%.3f"),
+    ("save_pct", "Save%", "%.3f"), ("pdo", "PDO", "%.3f"),
+    ("hdf", "HDC for", "%.0f"), ("hda", "HDC vs", "%.0f"),
+    ("hits", "Hits", "%.0f"), ("pim", "PIM", "%.0f"),
+    ("pp_pct", "PP%", "%.3f"), ("pk_pct", "PK%", "%.3f"), ("fow_pct", "FO%", "%.3f"),
 ]
 
 
@@ -270,10 +431,29 @@ def _history_tab(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
         return
     h["season_label"] = (h["season"].astype(int).astype(str) + "-"
                          + (h["season"].astype(int) + 1).astype(str).str[-2:])
-    n = st.slider("Seasons", 3, int(len(h)), min(10, len(h)), 1, key=f"hn_{team}")
+
+    # The last five seasons in one line, which is how a team gets described out loud.
+    rec = h.dropna(subset=["record"]).head(5)
+    if not rec.empty:
+        m = st.columns(len(rec))
+        for col, (_i, r) in zip(m, rec.iterrows()):
+            col.metric(str(r["season_label"]), str(r["record"]),
+                       delta=f"{int(r['pts'])} pts", delta_color="off")
+        five = rec.head(5)
+        st.caption(f"Last {len(five)} seasons: {int(five['w'].sum())}-"
+                   f"{int(five['l'].sum())}-{int(five['otl'].sum())}, "
+                   f"{five['pts_pct'].mean():.3f} points percentage. Records are wins-"
+                   "losses-overtime losses; an overtime or shootout loss still banks a "
+                   "point, which is why points and wins do not line up.")
+
+    c1, c2 = st.columns([1, 2])
+    n = c1.slider("Seasons", 3, int(len(h)), min(10, len(h)), 1, key=f"hn_{team}")
+    how = c2.radio("How", ["Per game", "Season totals"], horizontal=True,
+                   key=f"hhow_{team}")
     show = h.head(n)
 
-    cols = [(c, lab, fmt) for c, lab, fmt in HIST_COLS if c in show.columns]
+    spec = HIST_COLS if how == "Per game" else HIST_TOTAL_COLS
+    cols = [(c, lab, fmt) for c, lab, fmt in spec if c in show.columns]
     cfg = {c: (st.column_config.TextColumn(lab) if fmt is None
                else st.column_config.NumberColumn(lab, format=fmt))
            for c, lab, fmt in cols}
@@ -281,11 +461,17 @@ def _history_tab(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
                  column_config=cfg)
     renamed = sorted(set(show["as_named"]) - {team})
     st.caption(
-        "All rates are per game, because this history spans a 48-game lockout season, two "
-        "shortened Covid seasons and an 84-game season ahead. HDC is high-danger chances. "
-        "PDO is shooting plus save percentage: it barely persists year to year, so a team "
-        "well above 1.000 outscored its own chances and is the one a projection should "
-        "doubt most."
+        ("Season totals. Read down a column with the schedule length in mind: 2012-13 was "
+         "48 games, 2019-20 and 2020-21 were shortened, and the season being projected is "
+         "84. Switch to per game to compare them directly."
+         if how == "Season totals" else
+         "Per game, so seasons of different lengths can be compared directly — this "
+         "history spans a 48-game lockout season, two shortened Covid seasons and an "
+         "84-game season ahead. Switch to season totals for the numbers the budget tabs "
+         "are denominated in.")
+        + " HDC is high-danger chances. PDO is shooting plus save percentage: it barely "
+        "persists year to year, so a team well above 1.000 outscored its own chances and "
+        "is the one a projection should doubt most."
         + (f" Seasons played under {', '.join(renamed)} are this franchise's own."
            if renamed else ""))
 
@@ -297,23 +483,28 @@ def _history_tab(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
                "it — a long way outside is worth a look, and worth an edit if you "
                "disagree.")
     games = float(b["games"])
-    rows = [("Goals for", float(b["goals"]) / games, "gf_pg", "%.2f"),
-            ("Shots for", float(b["shots"]) / games, "sf_pg", "%.1f"),
-            ("Hits", float(b["hits"]) / games, "hits_pg", "%.1f"),
-            ("PIM", float(b["pim"]) / games, "pim_pg", "%.1f")]
+    # (label, per-game budget, history column, is it a per-game quantity at all)
+    rows = [("Goals for", float(b["goals"]) / games, "gf_pg", True),
+            ("Shots for", float(b["shots"]) / games, "sf_pg", True),
+            ("Hits", float(b["hits"]) / games, "hits_pg", True),
+            ("PIM", float(b["pim"]) / games, "pim_pg", True)]
     if gbb is not None:
         rows.insert(1, ("Goals against",
-                        float(gbb["goals_against"]) / float(gbb["games"]), "ga_pg", "%.2f"))
+                        float(gbb["goals_against"]) / float(gbb["games"]), "ga_pg", True))
         rows.insert(2, ("Shots against",
-                        float(gbb["shots_against"]) / float(gbb["games"]), "sa_pg", "%.1f"))
-        rows.append(("Save percentage", float(gbb["sv_pct"]), "save_pct", "%.3f"))
+                        float(gbb["shots_against"]) / float(gbb["games"]), "sa_pg", True))
+        rows.append(("Save percentage", float(gbb["sv_pct"]), "save_pct", False))
     out = []
-    for label, budgeted, col, _fmt in rows:
+    for label, budgeted, col, scales in rows:
         if col not in h.columns:
             continue
         s = h[col].dropna()
         last3, last5 = s.head(3), s.head(5)
         out.append({"": label, "Budget": budgeted,
+                    # The same budget as a season total, because that is the unit it is
+                    # stated and edited in on the other tabs -- 3.21 goals a game is the
+                    # readable number and 270 goals is the one being spent.
+                    "Budget, season": budgeted * games if scales else np.nan,
                     "Last season": float(s.iloc[0]) if len(s) else np.nan,
                     "3-year": float(last3.mean()) if len(last3) else np.nan,
                     "5-year": float(last5.mean()) if len(last5) else np.nan,
@@ -321,16 +512,21 @@ def _history_tab(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
                     "5-year high": float(last5.max()) if len(last5) else np.nan})
     cmp_df = pd.DataFrame(out)
     st.dataframe(cmp_df, hide_index=True, width="stretch", column_config={
-        c: st.column_config.NumberColumn(format="%.2f")
-        for c in ("Budget", "Last season", "3-year", "5-year", "5-year low",
-                  "5-year high")})
+        **{c: st.column_config.NumberColumn(format="%.2f")
+           for c in ("Budget", "Last season", "3-year", "5-year", "5-year low",
+                     "5-year high")},
+        "Budget, season": st.column_config.NumberColumn(
+            f"Budget × {games:.0f} games", format="%.0f")})
 
     st.divider()
     opts = {"Goals for and against per game": ["gf_pg", "ga_pg"],
+            "Standings points": ["pts"],
+            "Wins, losses and overtime losses": ["w", "l", "otl"],
             "Expected goals for and against per game": ["xgf_pg", "xga_pg"],
             "Share of expected goals": ["xg_share"],
             "Shooting and save percentage": ["shoot_pct", "save_pct"],
             "PDO": ["pdo"],
+            "Power play and penalty kill": ["pp_pct", "pk_pct"],
             "Shots for and against per game": ["sf_pg", "sa_pg"]}
     pick = st.selectbox("Trend", list(opts), key=f"htrend_{team}",
                         label_visibility="collapsed")
@@ -372,7 +568,7 @@ def _review_tab(team: str, on: pd.DataFrame, gs: pd.DataFrame, b: pd.Series) -> 
         "TOI/GP": dist["proj_toi_per_gp"], "PP/GP": dist["proj_pp_toi_per_gp"],
         "SH/GP": dist["proj_sh_toi_per_gp"],
         "Share of team minutes": dist["proj_toi"] / toi if toi else np.nan,
-        "PTS/60": dist["rate_points"], "PTS": dist["proj_points"],
+        "PTS/60": dist["per60_points"], "PTS": dist["proj_points"],
     }), hide_index=True, width="stretch", height=360, column_config={
         "Age": st.column_config.NumberColumn(format="%.0f"),
         "GP": st.column_config.NumberColumn(format="%.0f"),
@@ -394,7 +590,7 @@ def _review_tab(team: str, on: pd.DataFrame, gs: pd.DataFrame, b: pd.Series) -> 
             "Player": pp["name"], "Pos": pp["position"],
             "PP/GP": pp["proj_pp_toi_per_gp"],
             "Share": pp["proj_pp_toi"] / pp_total if pp_total else np.nan,
-            "PPP": pp["proj_pp_points"], "PPP/60": pp["rate_pp_points"],
+            "PPP": pp["proj_pp_points"], "PPP/60": pp["per60_pp_points"],
         }), hide_index=True, width="stretch", column_config={
             "PP/GP": st.column_config.NumberColumn(format="%.2f"),
             "Share": st.column_config.ProgressColumn(format="%.1f%%", min_value=0.0,
@@ -515,34 +711,54 @@ def _edit_form(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
                "the league's assists-per-goal ratio is not negotiable. This does not take "
                "the difference back off the other 31 teams — if you say a team scores 300, "
                "that is what you said.")
+
+    # Either unit, because a reader holds these two beliefs in different units. Goals are
+    # thought about per game -- "this is a 3.4-goals-a-game team" -- and hits and PIM are
+    # not thought about per game by anybody. What is STORED is always the season total,
+    # since that is what the budget is and what settlement spends; per game is a way of
+    # typing it, converted at this team's own game count so the two are exactly equivalent.
+    games = float(b["games"])
+    unit = st.radio("Enter as", ["Season totals", "Per game"], horizontal=True,
+                    key=f"tunit{team}",
+                    help=f"{team} plays {games:.0f} games, which is the number the two "
+                         f"units convert through.")
+    per_game = unit == "Per game"
+
+    def box(container, col: str, label: str, cap: float, now: float):
+        """One budget input, in whichever unit is selected."""
+        cur = edits.get(col)
+        div = games if per_game else 1.0
+        step = 0.05 if per_game else 5.0
+        fmt = "%.2f" if per_game else "%.0f"
+        return container.number_input(
+            f"{label} / game" if per_game else label, min_value=0.0, max_value=cap / div,
+            value=float(cur) / div if cur is not None else None, step=step, format=fmt,
+            placeholder=f"model says {now / div:,.2f}" if per_game
+            else f"model says {now:,.0f}", key=f"tb{team}{col}{int(per_game)}")
+
     values: dict[str, float | None] = {}
     cols = st.columns(3)
     for i, (col, label, cap) in enumerate(EDITABLE):
-        cur = edits.get(col)
         now = float(b[col]) if col in b.index else 0.0
-        values[col] = cols[i % 3].number_input(
-            label, min_value=0.0, max_value=cap,
-            value=float(cur) if cur is not None else None, step=5.0,
-            placeholder=f"model says {now:.0f}", key=f"tb{team}{col}")
+        values[col] = box(cols[i % 3], col, label, cap, now)
     if gbb is not None:
         cols = st.columns(3)
         for i, (col, label, cap) in enumerate(EDITABLE_G):
-            cur = edits.get(col)
-            now = float(gbb[col[7:]])
-            values[col] = cols[i % 3].number_input(
-                label, min_value=0.0, max_value=cap,
-                value=float(cur) if cur is not None else None, step=5.0,
-                placeholder=f"model says {now:.0f}", key=f"tb{team}{col}")
+            values[col] = box(cols[i % 3], col, label, cap, float(gbb[col[7:]]))
 
     b1, b2, _ = st.columns([1, 1, 3])
     if b1.button("Save budget", type="primary", key=f"tsave{team}"):
         patch: dict = {}
         for col, v in values.items():
             old = edits.get(col)
-            if v is None and old is not None:
+            # Back to a season total before anything is compared or stored, so switching
+            # units cannot register as an edit and a per-game entry means the same thing a
+            # total does.
+            want = None if v is None else float(v) * (games if per_game else 1.0)
+            if want is None and old is not None:
                 patch[col] = None
-            elif v is not None and (old is None or abs(float(old) - float(v)) >= 0.01):
-                patch[col] = float(v)
+            elif want is not None and (old is None or abs(float(old) - want) >= 0.01):
+                patch[col] = want
         if patch:
             core.edit_team(team, **patch)
         else:
@@ -551,7 +767,8 @@ def _edit_form(team: str, b: pd.Series, gbb: pd.Series | None) -> None:
         core.commit(core.scenario().clear_team(team), f"{team} budget back to the model")
     if edits:
         st.caption("Currently overriding: "
-                   + ", ".join(f"{k} = {v:g}" for k, v in sorted(edits.items())))
+                   + ", ".join(f"{k} = {v:g} ({float(v) / games:.2f} a game)"
+                               for k, v in sorted(edits.items())))
 
 
 # --------------------------------------------------------------------------- #

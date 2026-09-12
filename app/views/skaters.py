@@ -16,8 +16,13 @@ import core
 VIEWS: dict[str, list[str]] = {
     "Scoring": ["proj_gp", "proj_toi_per_gp", "proj_points", "points_p10", "points_p90",
                 "proj_goals", "proj_assists", "proj_shots", "proj_pp_points"],
-    "Per 60": ["proj_toi_per_gp", "rate_points", "rate_goals", "rate_primaryAssists",
-               "rate_secondaryAssists", "rate_shots", "rate_ixg", "rate_pp_points"],
+    # The PROJECTION's per-60, not the `rate_*` inputs it was built from. On a board of
+    # projected totals those are the numbers that describe the totals beside them: they move
+    # when an edit or a team budget moves the totals, and PTS/60 is G/60 plus A/60 rather
+    # than a separately blended figure that agrees with neither. The input rates are still
+    # editable one player at a time on the Player dashboard, which is where a rate belongs.
+    "Per 60": ["proj_toi_per_gp", "per60_points", "per60_goals", "per60_primaryAssists",
+               "per60_secondaryAssists", "per60_shots", "per60_ixg", "per60_pp_points"],
     "Physical": ["proj_gp", "proj_toi_per_gp", "proj_blocks", "proj_hits", "proj_pim",
                  "proj_faceoffs_won", "proj_points"],
     "Usage": ["proj_gp", "proj_toi_per_gp", "proj_pp_toi_per_gp", "proj_sh_toi_per_gp",
@@ -33,10 +38,11 @@ LABELS = {
     "proj_goals": "G", "proj_assists": "A", "proj_shots": "SOG", "proj_ixg": "ixG",
     "proj_pp_points": "PPP", "proj_sh_points": "SHP", "proj_blocks": "BLK",
     "proj_hits": "HIT", "proj_pim": "PIM", "proj_faceoffs_won": "FOW",
-    # The per-60 rates the projection is actually built from.
-    "rate_points": "PTS/60", "rate_goals": "G/60", "rate_primaryAssists": "A1/60",
-    "rate_secondaryAssists": "A2/60", "rate_shots": "SOG/60", "rate_ixg": "ixG/60",
-    "rate_pp_points": "PPP/60",
+    # The projection put back into per-60 terms: projected totals over projected minutes,
+    # after settlement. PPP/60 is per 60 minutes of POWER PLAY, not of total ice time.
+    "per60_points": "PTS/60", "per60_goals": "G/60", "per60_primaryAssists": "A1/60",
+    "per60_secondaryAssists": "A2/60", "per60_shots": "SOG/60", "per60_ixg": "ixG/60",
+    "per60_pp_points": "PPP/60",
 }
 ONE_DP = {"proj_gp", "proj_toi_per_gp", "proj_pp_toi_per_gp", "proj_sh_toi_per_gp",
           "proj_ixg"}
@@ -338,8 +344,8 @@ def page() -> None:
 
     view = st.radio("Columns", list(VIEWS), horizontal=True, label_visibility="collapsed")
     df = _filters(sk)
-    df = df.sort_values("rate_points" if view == "Per 60" else "proj_points",
-                        ascending=False).reset_index(drop=True)
+    df = df.sort_values("per60_points" if view == "Per 60" else "proj_points",
+                        ascending=False, na_position="last").reset_index(drop=True)
     pos = _grid(df, VIEWS[view])
 
     c1, c2 = st.columns([1.2, 4])

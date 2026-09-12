@@ -275,6 +275,39 @@ FRANCHISE_ALIASES = {
 }
 
 
+def _canonical_team(codes: pd.Series) -> pd.Series:
+    """Whatever the source called the franchise -> the code it goes by now."""
+    back = {old: new for new, olds in FRANCHISE_ALIASES.items() for old in olds}
+    return codes.map(lambda x: back.get(x, x))
+
+
+@st.cache_data(show_spinner="Loading team records ...")
+def team_records() -> pd.DataFrame:
+    """One row per team-season: the won-lost record and the standings points.
+
+    Kept apart from `team_history` because it comes from a different source -- MoneyPuck
+    has the shots and the expected goals and no wins at all -- and joined onto it below.
+    A record is the sentence a reader states a team in, so a team page without one is
+    asking them to judge a goal budget with no idea whether the team made the playoffs.
+    """
+    ts = dl.load_nhl_team_summary()
+    keep = {"mp_season_year": "season", "gamesPlayed": "gp", "wins": "w", "losses": "l",
+            "otLosses": "otl", "points": "pts", "pointPct": "pts_pct",
+            "regulationAndOtWins": "row", "winsInRegulation": "reg_w",
+            "faceoffWinPct": "fow_pct_api", "powerPlayPct": "pp_pct",
+            "penaltyKillPct": "pk_pct", "teamShutouts": "team_so"}
+    df = ts[["team"] + [c for c in keep if c in ts.columns]].rename(columns=keep).copy()
+    df["team"] = _canonical_team(df["team"])
+    # "43-30-9", written the way a standings page writes it, so it can be read as one thing.
+    df["record"] = (df["w"].astype("Int64").astype(str) + "-"
+                    + df["l"].astype("Int64").astype(str) + "-"
+                    + df["otl"].astype("Int64").astype(str))
+    # Points per game rather than points: 2013 was 48 games and 2026-27 is 84, so the
+    # totals are not comparable down a column and the rate is.
+    df["pts_pg"] = df["pts"] / df["gp"].replace(0, pd.NA)
+    return df
+
+
 @st.cache_data(show_spinner="Loading team history ...")
 def team_history() -> pd.DataFrame:
     """One row per team-season since 2008, with the rates a budget is judged against.
@@ -282,6 +315,11 @@ def team_history() -> pd.DataFrame:
     `team` is the CURRENT franchise code so a page can select on it; `as_named` keeps the
     code the season was actually played under, because a Utah page that silently labels
     2019 as Utah is lying about where those games were played.
+
+    Every counting column appears twice: `gf` is the season total and `gf_pg` is per game.
+    Both are needed and neither substitutes for the other -- the rate is what a 48-game
+    lockout season and an 84-game season can be compared on, and the total is the number
+    a reader actually remembers a team by.
     """
     t = dl.load_moneypuck_teams()
     # The source carries its own `season` and a duplicate `team.1`; drop both first or the
@@ -289,8 +327,7 @@ def team_history() -> pd.DataFrame:
     t = t.drop(columns=[c for c in ("season", "team.1") if c in t.columns])
     df = t.rename(columns={"mp_season_year": "season", "games_played": "gp"}).copy()
     df["as_named"] = df["team"]
-    back = {old: new for new, olds in FRANCHISE_ALIASES.items() for old in olds}
-    df["team"] = df["team"].map(lambda x: back.get(x, x))
+    df["team"] = _canonical_team(df["team"])
 
     gp = df["gp"].replace(0, pd.NA)
     for src, name in (("goalsFor", "gf"), ("goalsAgainst", "ga"),
@@ -321,12 +358,24 @@ def team_history() -> pd.DataFrame:
             ("fenwick", "unblockedShotAttemptsFor", "unblockedShotAttemptsAgainst")):
         if fcol in df.columns and acol in df.columns:
             df[name] = df[fcol] / (df[fcol] + df[acol]).replace(0, pd.NA)
-    keep = ["season", "team", "as_named", "gp", "gf", "ga", "gf_pg", "ga_pg", "gdiff_pg",
-            "xgf", "xga", "xgf_pg", "xga_pg", "xgdiff_pg", "sf_pg", "sa_pg", "shoot_pct",
-            "save_pct", "pdo", "hdf_pg", "hda_pg", "xg_share", "corsi", "fenwick",
-            "hits_pg", "pim_pg", "fow_pct", "takeaways_pg", "giveaways_pg"]
-    return df[[c for c in keep if c in df.columns]].sort_values(
-        ["team", "season"], ascending=[True, False]).reset_index(drop=True)
+    df["gdiff"] = df["gf"] - df["ga"]
+    df["xgdiff"] = df["xgf"] - df["xga"]
+    keep = ["season", "team", "as_named", "gp",
+            # totals and per-game, side by side, so a page can offer either
+            "gf", "ga", "gdiff", "xgf", "xga", "xgdiff", "sf", "sa", "hdf", "hda",
+            "hits", "pim", "takeaways", "giveaways",
+            "gf_pg", "ga_pg", "gdiff_pg", "xgf_pg", "xga_pg", "xgdiff_pg", "sf_pg",
+            "sa_pg", "hdf_pg", "hda_pg", "hits_pg", "pim_pg", "takeaways_pg",
+            "giveaways_pg",
+            # ratios, which are the same number either way
+            "shoot_pct", "save_pct", "pdo", "xg_share", "corsi", "fenwick", "fow_pct"]
+    out = df[[c for c in keep if c in df.columns]]
+    # The record comes from the NHL API rather than MoneyPuck, so it is joined on rather
+    # than computed. A left join: a season with no record row keeps its rates and shows a
+    # blank record, which is the truth about it.
+    rec = team_records().drop(columns=["gp"], errors="ignore")
+    out = out.merge(rec, on=["team", "season"], how="left")
+    return out.sort_values(["team", "season"], ascending=[True, False]).reset_index(drop=True)
 
 
 @st.cache_data(show_spinner="Reading the schedule ...")
