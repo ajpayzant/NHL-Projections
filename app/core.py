@@ -192,6 +192,102 @@ def baseline_goalies() -> tuple[pd.DataFrame, pd.DataFrame]:
     return _goalies(_goalie_key(ov.Scenario()), live_token())
 
 
+# --------------------------------------------------------------------------- #
+# freezing a projection                                                       #
+# --------------------------------------------------------------------------- #
+# What a saved scenario keeps a copy of. A projection is reproducible from the edits plus
+# the data, but only the data of that day -- so a preseason projection cannot be recovered
+# in February by replaying the edits, because February's rates are not September's. These
+# are therefore stored as numbers, once, and never recomputed.
+FROZEN_SKATER_COLS = [
+    "playerId", "name", "team", "position", "proj_gp", "proj_toi_per_gp",
+    "proj_pp_toi_per_gp", "proj_goals", "proj_assists", "proj_points", "points_p10",
+    "points_p90", "gp_p10", "gp_p90", "proj_shots", "proj_ixg", "proj_pp_points",
+    "proj_sh_points", "proj_blocks", "proj_hits", "proj_pim", "proj_faceoffs_won",
+    "per60_points", "edited",
+]
+FROZEN_GOALIE_COLS = [
+    "playerId", "name", "team", "proj_starts", "starts_p10", "starts_p90", "proj_gp",
+    "proj_wins", "wins_p10", "wins_p90", "proj_losses", "proj_otl", "proj_save_pct",
+    "proj_gaa", "proj_shutouts", "shutouts_p10", "shutouts_p90", "proj_saves",
+    "proj_shots_against", "edited",
+]
+
+
+def _round_for_freeze(col: str, value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (bool, str)):
+        return value
+    if pd.isna(value):
+        return None
+    v = float(value)
+    # A tenth is plenty for a season total and keeps the file small, but it destroys
+    # anything living between 0 and 1 -- a .906 save percentage rounds to 0.9, which is not
+    # a save percentage. Those get their own precision.
+    if col in ("proj_save_pct", "team_sv_pct", "toi_coverage", "goalie_coverage"):
+        return round(v, 4)
+    if col.startswith("per60_") or col.endswith("_per_gp") or col == "proj_gaa":
+        return round(v, 3)
+    return round(v, 1)
+
+
+def _freeze_block(df: pd.DataFrame, cols: list[str]) -> dict:
+    """Columnar, not a list of records: the same 24 keys repeated 900 times is most of the
+    file, and the frozen copy has to be small enough to live in a gist beside the edits."""
+    cols = [c for c in cols if c in df.columns]
+    rows = [[_round_for_freeze(c, r[c]) for c in cols]
+            for _, r in df[cols].iterrows()]
+    return {"cols": cols, "rows": rows}
+
+
+def frozen_snapshot(sc: ov.Scenario | None = None) -> dict:
+    """The projection as it stands right now, in a form that can be stored and reread.
+
+    Everyone on a roster, plus anybody edited who is not (a free agent given a team, a
+    prospect written into a lineup), because those are exactly the players a reader saved
+    the scenario to argue about.
+    """
+    sc = sc or scenario()
+    sk, tb = skaters(sc)
+    g, gb = goalies(sc)
+    keep_sk = sk["on_roster"] | sk["edited"]
+    keep_g = g["on_roster"] | g["edited"]
+    sk_f = sk[keep_sk].sort_values("proj_points", ascending=False)
+    g_f = g[keep_g].sort_values("proj_starts", ascending=False)
+
+    teams = pd.DataFrame({
+        "team": tb.index,
+        "games": tb["games"].to_numpy(),
+        "goals_budget": tb["goals"].to_numpy(),
+        "points_budget": tb["points"].to_numpy(),
+        "toi_coverage": tb["toi_coverage"].to_numpy(),
+    })
+    on_sk = sk[sk["on_roster"]]
+    on_g = g[g["on_roster"]]
+    teams["goals_projected"] = [float(on_sk.loc[on_sk["team"] == t, "proj_goals"].sum())
+                                for t in tb.index]
+    teams["points_projected"] = [float(on_sk.loc[on_sk["team"] == t, "proj_points"].sum())
+                                 for t in tb.index]
+    teams["wins_projected"] = [float(on_g.loc[on_g["team"] == t, "proj_wins"].sum())
+                               for t in tb.index]
+    if "sv_pct" in gb.columns:
+        teams["team_sv_pct"] = gb["sv_pct"].reindex(tb.index).to_numpy()
+
+    return {
+        "season": SEASON_LABEL,
+        # What the numbers already contained when they were frozen. A season total holding
+        # 24 played games is a different claim from one holding none, and six months later
+        # that is the first thing a reader needs to know about the file he is opening.
+        "window": window_label(),
+        "frozen_at": pd.Timestamp.now(tz="UTC").isoformat(timespec="seconds"),
+        "skaters": _freeze_block(sk_f, FROZEN_SKATER_COLS),
+        "goalies": _freeze_block(g_f, FROZEN_GOALIE_COLS),
+        "teams": _freeze_block(teams.sort_values("points_budget", ascending=False),
+                               list(teams.columns)),
+    }
+
+
 # The counting stats a reader compares season to season, and the clock each one is
 # measured against. Keeping the pairing here means the history tables and the projection
 # agree on what "per 60" means -- even-strength-clock stats are per 60 minutes of TOTAL

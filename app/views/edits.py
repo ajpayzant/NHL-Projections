@@ -171,10 +171,17 @@ def _files() -> None:
         st.markdown("**Publish this scenario**" if core.MULTIUSER else "**Save a copy**")
         name = st.text_input("Name", placeholder="opening-night", key="save_name")
         who = st.text_input("Your name", placeholder="who to credit it to", key="save_who")
+        freeze = st.checkbox(
+            "Keep today's numbers with it", value=True, key="save_freeze",
+            help="Stores the projection exactly as it stands now, player by player. Without "
+                 "this the save is only the list of edits, and opening it in February "
+                 "reprojects them on February's data — so a preseason number could not be "
+                 "read back as it was.")
         if st.button("Publish" if core.MULTIUSER else "Save as",
                      disabled=not name.strip() or sc.is_baseline, width="stretch"):
             try:
-                res = library.save(sc, name, who)
+                snap = core.frozen_snapshot(sc) if freeze else None
+                res = library.save(sc, name, who, frozen_numbers=snap)
             except (ValueError, requests.RequestException) as exc:
                 st.error(f"Could not save it: {exc}")
             else:
@@ -190,6 +197,15 @@ def _files() -> None:
                 else:
                     st.warning(f"Saved as **{res['name']}**, but only in {res['where']}. "
                                "Download the JSON if you need it tomorrow.", icon="⚠️")
+                if res["verified"] and freeze:
+                    if res["frozen"]:
+                        st.caption(f"Numbers frozen too — {res['frozen_bytes'] / 1024:.0f} "
+                                   "KB of projections that will not move again. Open them "
+                                   "under *Review one exactly as it was saved*.")
+                    else:
+                        st.error("The scenario saved but its numbers did not. Reading it "
+                                 "back later will reproject the edits on that day's data.",
+                                 icon="🚨")
         if sc.is_baseline:
             st.caption("Nothing to save yet — this is the model's own projection.")
         st.download_button("Download this scenario (JSON)", sc.to_json().encode("utf-8"),
@@ -197,17 +213,21 @@ def _files() -> None:
                            width="stretch")
     with c2:
         st.markdown("**Open a saved one**")
-        st.caption(f"Stored in {library.where()}. A saved scenario is the list of EDITS, "
-                   "not a frozen sheet of numbers, so opening it later replays those edits "
-                   "against the latest data — which is what makes it worth coming back to "
-                   "as the season goes on.")
+        st.caption(f"Stored in {library.where()}. Two things live under each name: the EDITS, "
+                   "which reproject on today's data when you open them, and — if it was "
+                   "saved with its numbers — a frozen copy of the projection as it stood "
+                   "that day, which never moves again.")
         rows = library.entries()
         if rows:
-            st.dataframe(pd.DataFrame(rows)[["name", "author", "saved", "edits"]],
+            st.dataframe(pd.DataFrame(rows)[["name", "author", "saved", "edits", "frozen"]],
                          hide_index=True, width="stretch",
                          height=min(220, 60 + 35 * len(rows)),
-                         column_config={"name": "Scenario", "author": "By",
-                                        "saved": "Saved (UTC)", "edits": "Edits"})
+                         column_config={
+                             "name": "Scenario", "author": "By", "saved": "Saved (UTC)",
+                             "edits": "Edits",
+                             "frozen": st.column_config.CheckboxColumn(
+                                 "Numbers kept",
+                                 help="the projection was frozen as it stood when saved")})
         else:
             st.caption("The library is empty. Publish one and it shows up here for "
                        "everyone.")
@@ -236,6 +256,123 @@ def _files() -> None:
                 return
             loaded.name = "working"
             core.commit(loaded, "Loaded the uploaded scenario")
+
+    st.divider()
+    _frozen_review(pick)
+
+
+# --------------------------------------------------------------------------- #
+# reading a saved projection back exactly as it was                           #
+# --------------------------------------------------------------------------- #
+FROZEN_LABELS = {
+    "name": "Player", "team": "Team", "position": "Pos", "proj_gp": "GP",
+    "proj_toi_per_gp": "TOI/GP", "proj_pp_toi_per_gp": "PP/GP", "proj_goals": "G",
+    "proj_assists": "A", "proj_points": "PTS", "points_p10": "PTS floor",
+    "points_p90": "PTS ceiling", "gp_p10": "GP floor", "gp_p90": "GP ceiling",
+    "proj_shots": "SOG", "proj_ixg": "ixG", "proj_pp_points": "PPP",
+    "proj_sh_points": "SHP", "proj_blocks": "BLK", "proj_hits": "HIT", "proj_pim": "PIM",
+    "proj_faceoffs_won": "FOW", "per60_points": "PTS/60", "edited": "Edited",
+    "proj_starts": "GS", "starts_p10": "GS floor", "starts_p90": "GS ceiling",
+    "proj_wins": "W", "wins_p10": "W floor", "wins_p90": "W ceiling", "proj_losses": "L",
+    "proj_otl": "OTL", "proj_save_pct": "SV%", "proj_gaa": "GAA", "proj_shutouts": "SO",
+    "shutouts_p10": "SO floor", "shutouts_p90": "SO ceiling", "proj_saves": "SV",
+    "proj_shots_against": "SA", "games": "Games", "goals_budget": "Goals budget",
+    "points_budget": "Points budget", "toi_coverage": "Roster covers",
+    "goals_projected": "Goals projected", "points_projected": "Points projected",
+    "wins_projected": "Wins projected", "team_sv_pct": "Team SV%",
+}
+# What "then versus now" is worth comparing on. Everything else is in the table anyway.
+COMPARE = {"skaters": ("proj_points", "PTS"), "goalies": ("proj_wins", "W"),
+           "teams": ("points_projected", "Points projected")}
+
+
+def _frozen_review(pick: str) -> None:
+    st.markdown("**Review one exactly as it was saved**")
+    if pick in (None, "(none)"):
+        st.caption("Pick a scenario above. If it was saved with its numbers, the projection "
+                   "it produced that day can be read back here — unchanged, however much "
+                   "data has arrived since.")
+        return
+
+    snap = library.frozen(pick)
+    if not snap:
+        st.info(f"**{pick}** was saved without its numbers, so there is nothing frozen to "
+                "read. Opening it reprojects its edits on today's data.")
+        return
+
+    head = [f"frozen {(snap.get('frozen_at') or snap.get('saved_at') or '')[:16].replace('T', ' ')} UTC",
+            f"by {snap.get('author') or '-'}", snap.get("season", ""),
+            snap.get("window", "")]
+    st.caption(" · ".join(b for b in head if b))
+
+    kind = st.radio("What", ["skaters", "goalies", "teams"], horizontal=True,
+                    format_func=str.title, key="frz_kind", label_visibility="collapsed")
+    frz = library.frozen_table(snap, kind)
+    if frz.empty:
+        st.info("Nothing of that kind was frozen.")
+        return
+
+    key_col = "playerId" if kind != "teams" else "team"
+    now_col, now_label = COMPARE[kind]
+    compare = st.checkbox(
+        "Compare with what this scenario says today", key="frz_cmp",
+        help="Reprojects the same edits on today's data and shows the difference. The "
+             "frozen column never changes; only the comparison does.")
+
+    show = frz.drop(columns=["playerId"], errors="ignore")
+    if compare:
+        try:
+            sc_then = library.load(pick)
+        except (FileNotFoundError, requests.RequestException) as exc:
+            st.error(f"Could not reload the scenario to compare: {exc}")
+            sc_then = None
+        if sc_then is not None:
+            now = _now_frame(sc_then, kind, now_col)
+            merged = frz.merge(now, on=key_col, how="left")
+            merged["Δ"] = merged["_now"] - merged[now_col]
+            show = merged.drop(columns=["playerId"], errors="ignore").rename(
+                columns={"_now": f"{now_label} now"})
+
+    cfg = {}
+    for c in show.columns:
+        label = FROZEN_LABELS.get(c, c)
+        # Bools first: pandas calls a bool column numeric, and "1.0" is not what "edited"
+        # means to a reader.
+        if pd.api.types.is_bool_dtype(show[c]):
+            cfg[c] = st.column_config.CheckboxColumn(label)
+        elif pd.api.types.is_numeric_dtype(show[c]):
+            fmt = ("%.3f" if c in ("proj_save_pct", "toi_coverage", "team_sv_pct")
+                   else "%.2f" if c in ("proj_gaa", "per60_points") or c.endswith("_per_gp")
+                   else "%.1f")
+            cfg[c] = st.column_config.NumberColumn(label, format=fmt)
+        else:
+            cfg[c] = st.column_config.TextColumn(label)
+    if "Δ" in show.columns:
+        cfg["Δ"] = st.column_config.NumberColumn(f"{now_label} change", format="%+.1f")
+    st.dataframe(show, hide_index=True, width="stretch", height=460, column_config=cfg)
+
+    c1, c2 = st.columns([1.4, 3])
+    c1.download_button(f"Download the frozen {kind} (CSV)",
+                       show.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{pick}_{kind}_as_saved.csv", mime="text/csv",
+                       width="stretch")
+    c2.caption(f"{len(frz)} rows, exactly as projected on "
+               f"{(snap.get('frozen_at') or '')[:10]}. Deleting the scenario is the only "
+               "thing that removes them.")
+
+
+def _now_frame(sc_then, kind: str, col: str) -> pd.DataFrame:
+    """One column of today's projection of the same edits, keyed for the merge."""
+    if kind == "skaters":
+        df, _ = core.skaters(sc_then)
+        return df[["playerId", col]].rename(columns={col: "_now"})
+    if kind == "goalies":
+        df, _ = core.goalies(sc_then)
+        return df[["playerId", col]].rename(columns={col: "_now"})
+    sk, _ = core.skaters(sc_then)
+    on = sk[sk["on_roster"]]
+    tot = on.groupby("team")["proj_points"].sum().rename("_now").reset_index()
+    return tot
 
 
 def page() -> None:

@@ -80,10 +80,17 @@ configured, a saved scenario lasts until somebody deletes it — through restart
 and every weekly data refresh — and every save is read back out of the library and compared
 against what was sent before the page calls it saved.
 
-A saved scenario holds the EDITS, not a frozen sheet of numbers, so opening one in December
-replays those edits against December's data. That is what makes it worth keeping; it also
-means the totals inside it move over the season, which is by design. Frozen dated numbers
-are what `data/snapshots/` and the Model performance page are for.
+**Edits, and optionally the numbers they produced.** A scenario is the list of EDITS, so
+opening one in December replays them against December's data — that is what makes it worth
+keeping, and it is also why a preseason projection could not be read back as it was. So a
+save can carry a frozen copy of the projection as it stood: *Keep today's numbers with it*,
+on by default, writes a second file (`frozen__<name>.json` in the gist, `scenarios/frozen/`
+on disk — about 110 KB for 700 skaters, 94 goalies and 32 teams, stored columnar and tied to
+the digest of the edits it came from). Those numbers never change again; only a delete
+removes them. **Scenario → Save & share → Review one exactly as it was saved** reads them
+back, with an optional column comparing them against what the same edits project today, and
+a CSV download. Dated *baseline* projections are separate — that is `data/snapshots/` and
+the Model performance page.
 
 ## The app
 

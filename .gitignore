@@ -11,6 +11,7 @@ data/processed/*
 # Local scenario state. The working scenario is one person's scratch pad, and saved
 # scenarios belong in the shared library, not in the source tree.
 scenarios/*.json
+scenarios/frozen/
 
 __pycache__/
 *.pyc

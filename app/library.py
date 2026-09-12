@@ -35,6 +35,17 @@ GIST_API = "https://api.github.com/gists"
 PREFIX = "scenario__"          # so the gist can hold other files without confusing us
 TIMEOUT = 20
 
+# A scenario is the EDITS, so opening one in December replays them against December's data
+# and the totals move. That is the right default -- it is what makes a scenario worth
+# keeping -- but it is not a record. A preseason projection is a statement made on a date,
+# and if the numbers behind it drift the statement cannot be checked or even reread.
+#
+# So a save can carry a FROZEN copy of the numbers it produced: the projection exactly as it
+# stood, stored beside the scenario under its own name so the small readable edit file stays
+# small and readable, and so listing the library never downloads a megabyte of totals.
+FROZEN_PREFIX = "frozen__"
+FROZEN_DIR = C.SCENARIOS / "frozen"
+
 
 # --------------------------------------------------------------------------- #
 # which backend                                                               #
@@ -90,23 +101,37 @@ def _headers(tok: str) -> dict:
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def _gist_files(gid: str, tok: str, bust: int = 0) -> dict[str, str]:
-    """{name: json text} for every scenario in the gist. Cached briefly.
+def _gist_index(gid: str, tok: str, bust: int = 0) -> dict[str, dict]:
+    """Every file in the gist as {filename: {content, truncated, raw_url}}. Cached briefly.
+
+    One GET serves both the scenario list and the frozen snapshots, and the big frozen
+    payloads are left as whatever the API gave us -- only the one actually being opened
+    pays for a raw fetch.
 
     `bust` is bumped after a write so the next read cannot serve a stale list -- the
     alternative, a 20-second window in which your own save is invisible, reads as a bug.
     """
     r = requests.get(f"{GIST_API}/{gid}", headers=_headers(tok), timeout=TIMEOUT)
     r.raise_for_status()
-    out = {}
-    for fname, meta in (r.json().get("files") or {}).items():
-        if not fname.startswith(PREFIX) or not fname.endswith(".json"):
-            continue
-        text = meta.get("content")
-        if meta.get("truncated") and meta.get("raw_url"):
-            text = requests.get(meta["raw_url"], timeout=TIMEOUT).text
-        out[fname[len(PREFIX):-5]] = text or ""
-    return out
+    return {f: {"content": m.get("content") or "",
+                "truncated": bool(m.get("truncated")),
+                "raw_url": m.get("raw_url") or ""}
+            for f, m in (r.json().get("files") or {}).items()}
+
+
+def _gist_text(meta: dict) -> str:
+    """The whole file. The API inlines content up to 1 MB and truncates past it, and a
+    frozen snapshot of 900 skaters is exactly the size that starts hitting that."""
+    if meta["truncated"] and meta["raw_url"]:
+        return requests.get(meta["raw_url"], timeout=TIMEOUT).text
+    return meta["content"]
+
+
+def _gist_files(gid: str, tok: str, bust: int = 0) -> dict[str, str]:
+    """{scenario name: json text}. Frozen files are a different prefix, so they are out."""
+    return {f[len(PREFIX):-5]: _gist_text(m)
+            for f, m in _gist_index(gid, tok, bust).items()
+            if f.startswith(PREFIX) and f.endswith(".json")}
 
 
 def _gist_write(gid: str, tok: str, fname: str, content: str | None) -> None:
@@ -155,6 +180,9 @@ def entries() -> list[dict]:
             if p.stem == "working":
                 continue
             rows.append(_meta(p.stem, p.read_text(encoding="utf-8")))
+    froze = frozen_names()
+    for r in rows:
+        r["frozen"] = r["name"] in froze
     return sorted(rows, key=lambda r: r["saved"], reverse=True)
 
 
@@ -162,8 +190,14 @@ def names() -> list[str]:
     return [r["name"] for r in entries()]
 
 
-def save(sc: ov.Scenario, name: str, author: str = "") -> dict:
+def save(sc: ov.Scenario, name: str, author: str = "",
+         frozen_numbers: dict | None = None) -> dict:
     """Publish a copy of `sc` under `name`. Overwrites a scenario of the same name.
+
+    `frozen_numbers` is an optional snapshot of the projection this scenario produced (see
+    `core.frozen_snapshot`), stored as its own file so the scenario stays a small readable
+    list of edits. With it, the save is a dated record that never moves; without it, the
+    save is only a recipe that will be recooked with later data.
 
     Returns what actually happened -- the stored name (which is sanitised, so it is not
     always the name that was typed), the store it went to, whether that store survives a
@@ -189,6 +223,21 @@ def save(sc: ov.Scenario, name: str, author: str = "") -> dict:
         _gist_write(*g, f"{PREFIX}{name}.json", copy.to_json())
     else:
         copy.save(C.SCENARIOS / f"{name}.json")
+
+    froze = 0
+    if frozen_numbers:
+        # Tied to the digest of the edits it was produced from, so a snapshot can never be
+        # read as a record of a scenario it does not belong to.
+        payload = {**frozen_numbers, "scenario": name, "digest": sc.digest,
+                   "saved_at": notes["saved_at"], "author": notes["author"]}
+        text = json.dumps(payload, separators=(",", ":"), default=str)
+        if g:
+            _gist_write(*g, f"{FROZEN_PREFIX}{name}.json", text)
+        else:
+            FROZEN_DIR.mkdir(parents=True, exist_ok=True)
+            (FROZEN_DIR / f"{name}.json").write_text(text, encoding="utf-8")
+        froze = len(text)
+
     # Read it back. A write that raised nothing is not the same as a scenario that is in
     # the library, and the round trip also proves the stored JSON still parses.
     verified = False
@@ -196,8 +245,59 @@ def save(sc: ov.Scenario, name: str, author: str = "") -> dict:
         verified = load(name).digest == sc.digest
     except (FileNotFoundError, ValueError, requests.RequestException):
         verified = False
+    frozen_ok = None
+    if frozen_numbers:
+        snap = frozen(name)
+        frozen_ok = bool(snap) and snap.get("digest") == sc.digest
     return {"name": name, "backend": backend(), "durable": durable(),
-            "verified": verified, "where": where()}
+            "verified": verified, "where": where(), "frozen": frozen_ok,
+            "frozen_bytes": froze}
+
+
+# --------------------------------------------------------------------------- #
+# frozen numbers                                                              #
+# --------------------------------------------------------------------------- #
+def frozen(name: str) -> dict | None:
+    """The projection as it stood when `name` was saved, or None if it was not frozen."""
+    g = _gist()
+    if g:
+        try:
+            idx = _gist_index(*g, bust=st.session_state.get("lib_bust", 0))
+        except requests.RequestException:
+            return None
+        meta = idx.get(f"{FROZEN_PREFIX}{name}.json")
+        if not meta:
+            return None
+        text = _gist_text(meta)
+    else:
+        path = FROZEN_DIR / f"{name}.json"
+        if not path.exists():
+            return None
+        text = path.read_text(encoding="utf-8")
+    try:
+        return json.loads(text) or None
+    except json.JSONDecodeError:
+        return None
+
+
+def frozen_names() -> set[str]:
+    """Which saved scenarios kept their numbers -- for a column in the library list."""
+    g = _gist()
+    if g:
+        try:
+            idx = _gist_index(*g, bust=st.session_state.get("lib_bust", 0))
+        except requests.RequestException:
+            return set()
+        return {f[len(FROZEN_PREFIX):-5] for f in idx
+                if f.startswith(FROZEN_PREFIX) and f.endswith(".json")}
+    return {p.stem for p in FROZEN_DIR.glob("*.json")} if FROZEN_DIR.exists() else set()
+
+
+def frozen_table(snap: dict, kind: str) -> "pd.DataFrame":
+    """One frozen table back as a DataFrame. Stored columnar, so this is the only reader."""
+    import pandas as pd
+    block = (snap or {}).get(kind) or {}
+    return pd.DataFrame(block.get("rows") or [], columns=block.get("cols") or [])
 
 
 def load(name: str) -> ov.Scenario:
@@ -217,8 +317,13 @@ def load(name: str) -> ov.Scenario:
 
 
 def delete(name: str) -> None:
+    """Remove a scenario and its frozen numbers. Deleting is the ONLY thing that removes
+    either -- no restart, redeploy or data refresh does."""
     g = _gist()
     if g:
         _gist_write(*g, f"{PREFIX}{name}.json", None)
+        if name in frozen_names():
+            _gist_write(*g, f"{FROZEN_PREFIX}{name}.json", None)
     else:
         (C.SCENARIOS / f"{name}.json").unlink(missing_ok=True)
+        (FROZEN_DIR / f"{name}.json").unlink(missing_ok=True)
