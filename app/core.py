@@ -470,4 +470,11 @@ def scenario_bar() -> None:
             st.caption("Your edits are yours alone — nobody else's view changes, and "
                        "nothing you do here is saved automatically. Publish them on the "
                        "**Scenario** page to let others open them, or download the JSON.")
+            # Said on every page rather than only on the page with the save button: by the
+            # time somebody goes looking for the save button he has already done the work
+            # he is about to lose.
+            import library                                       # noqa: PLC0415
+            if not sc.is_baseline and not library.durable():
+                st.warning("Saving is temporary until a scenario library is configured — "
+                           "see **Scenario → Save & share**.", icon="⚠️")
         st.divider()

@@ -67,6 +67,10 @@ def _edit_list() -> None:
         st.success("No edits. Every number in the app is the model's own opinion.")
         return
     df = pd.DataFrame(rows)
+    # One column holding 80.0, True and "1 units, 3 players" has no Arrow type, so Streamlit
+    # was serialising it, failing, logging a traceback and silently retrying as text. Make it
+    # text here instead, and trim the float noise on the way.
+    df["Value"] = [f"{v:g}" if isinstance(v, float) else str(v) for v in df["Value"]]
     st.dataframe(df.drop(columns=["_bucket", "_key"]), hide_index=True, width="stretch",
                  height=min(420, 60 + 35 * len(df)))
 
@@ -134,9 +138,29 @@ def _files() -> None:
                    "Publishing one puts it in the shared library below, where anyone can "
                    "open it and see exactly what you changed.")
         if not library.durable():
-            st.warning("No scenario library is configured, so anything published here "
-                       "lasts only until the app restarts. Download the JSON if you want "
-                       "to keep it. (Setup: a gist id and token in the app's secrets.)")
+            # An error, not a caption. Publishing into a disk that is about to be wiped
+            # looks identical to publishing properly until the day you come back for it,
+            # so the page has to be unpleasant about it while it is still fixable.
+            st.error(
+                "**Nothing published here will survive a restart.** No durable scenario "
+                "library is configured, so a published scenario goes to "
+                f"{library.where()}. Download the JSON below to keep this one, and set the "
+                "library up so it stops happening.", icon="🚨")
+            with st.expander("How to make saved scenarios permanent (one-time setup)"):
+                st.markdown(
+                    "1. On GitHub: **+ → New gist**, one file named `readme.txt` with any "
+                    "text, then **Create secret gist**. The id is the last part of its "
+                    "URL.\n"
+                    "2. **Settings → Developer settings → Personal access tokens → "
+                    "Fine-grained tokens → Generate new token**, and under *Account "
+                    "permissions* give it **Gists: read and write**. Nothing else.\n"
+                    "3. In Streamlit Cloud: your app → **⋮ → Settings → Secrets**, paste "
+                    "the two lines below with your own values, and save. The app reboots "
+                    "and the library is durable from then on — through restarts, "
+                    "redeploys and every weekly data refresh.")
+                st.code('gist_id = "…"\ngithub_token = "…"', language="toml")
+                st.caption("The gist is private, the token stays in Streamlit's secret "
+                           "store, and neither ever enters this public repository.")
     else:
         st.caption("A scenario is a small JSON file of only the disagreements, so it can "
                    "be read, diffed and mailed to someone. The working scenario is saved "
@@ -150,11 +174,22 @@ def _files() -> None:
         if st.button("Publish" if core.MULTIUSER else "Save as",
                      disabled=not name.strip() or sc.is_baseline, width="stretch"):
             try:
-                library.save(sc, name, who)
+                res = library.save(sc, name, who)
             except (ValueError, requests.RequestException) as exc:
                 st.error(f"Could not save it: {exc}")
             else:
-                st.success(f"Saved as {name.strip()}")
+                # Three outcomes, and they are told apart on purpose. The library is read
+                # back after every write, so "saved" here means the scenario was found
+                # again and still matched, not merely that nothing raised.
+                if not res["verified"]:
+                    st.error(f"**{res['name']} did not read back from the library.** "
+                             "Treat it as unsaved, download the JSON, and try again.",
+                             icon="🚨")
+                elif res["durable"]:
+                    st.success(f"Saved as **{res['name']}** in {res['where']}.")
+                else:
+                    st.warning(f"Saved as **{res['name']}**, but only in {res['where']}. "
+                               "Download the JSON if you need it tomorrow.", icon="⚠️")
         if sc.is_baseline:
             st.caption("Nothing to save yet — this is the model's own projection.")
         st.download_button("Download this scenario (JSON)", sc.to_json().encode("utf-8"),
@@ -162,6 +197,10 @@ def _files() -> None:
                            width="stretch")
     with c2:
         st.markdown("**Open a saved one**")
+        st.caption(f"Stored in {library.where()}. A saved scenario is the list of EDITS, "
+                   "not a frozen sheet of numbers, so opening it later replays those edits "
+                   "against the latest data — which is what makes it worth coming back to "
+                   "as the season goes on.")
         rows = library.entries()
         if rows:
             st.dataframe(pd.DataFrame(rows)[["name", "author", "saved", "edits"]],

@@ -70,8 +70,20 @@ gist_id = "…"        # create an empty secret gist; the id is the last part of
 github_token = "…"   # a fine-grained token with read+write on Gists and nothing else
 ```
 
-Without those two the library falls back to the container's disk and says so on the page —
-publishing still works, it just does not survive a restart.
+**Set those two before anyone saves anything they care about.** Without them the library
+falls back to the container's disk, which is wiped on restart, on redeploy and when the app
+sleeps — so a published scenario disappears. The app now refuses to be quiet about it: the
+Save & share tab leads with a red warning and the setup steps, the sidebar repeats it on
+every page once you have edits, and a save into the temporary disk is reported as a warning
+("saved, but only until the app restarts") rather than as a success. With the gist
+configured, a saved scenario lasts until somebody deletes it — through restarts, redeploys
+and every weekly data refresh — and every save is read back out of the library and compared
+against what was sent before the page calls it saved.
+
+A saved scenario holds the EDITS, not a frozen sheet of numbers, so opening one in December
+replays those edits against December's data. That is what makes it worth keeping; it also
+means the totals inside it move over the season, which is by design. Frozen dated numbers
+are what `data/snapshots/` and the Model performance page are for.
 
 ## The app
 

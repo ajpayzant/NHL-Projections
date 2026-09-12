@@ -56,9 +56,29 @@ def backend() -> str:
     return "gist" if _gist() else "disk"
 
 
+# Streamlit Community Cloud checks the repo out under /mount/src and rebuilds that checkout
+# on every redeploy, and the container is torn down when the app sleeps. So "disk" there
+# means "until the next restart", while on your own machine it means your own filesystem.
+# The difference decides whether the app is allowed to call a save permanent, which is the
+# one thing it must not get wrong: a save reported as successful and then lost is worse
+# than a save that was refused.
+EPHEMERAL_DISK = "/mount/src" in C.ROOT.as_posix()
+
+
 def durable() -> bool:
-    """Do saves survive a restart? False means the app should say so."""
-    return backend() == "gist"
+    """Do saves survive a restart? False means the app has to say so, loudly."""
+    return backend() == "gist" or not EPHEMERAL_DISK
+
+
+def where() -> str:
+    """One sentence naming the store, for the page to print next to the save button."""
+    if backend() == "gist":
+        return ("a GitHub gist, kept until somebody deletes it — it survives restarts, "
+                "redeploys and every data refresh")
+    if EPHEMERAL_DISK:
+        return ("this container's temporary disk, which is wiped when the app restarts, "
+                "redeploys or goes to sleep")
+    return f"`{C.SCENARIOS}` on this machine, kept until you delete the file"
 
 
 # --------------------------------------------------------------------------- #
@@ -142,8 +162,15 @@ def names() -> list[str]:
     return [r["name"] for r in entries()]
 
 
-def save(sc: ov.Scenario, name: str, author: str = "") -> None:
-    """Publish a copy of `sc` under `name`. Overwrites a scenario of the same name."""
+def save(sc: ov.Scenario, name: str, author: str = "") -> dict:
+    """Publish a copy of `sc` under `name`. Overwrites a scenario of the same name.
+
+    Returns what actually happened -- the stored name (which is sanitised, so it is not
+    always the name that was typed), the store it went to, whether that store survives a
+    restart, and whether reading the library back found it. The caller reports those rather
+    than assuming success, because "Saved as opening-night" over a scenario that is already
+    gone is the failure that costs somebody an afternoon of edits.
+    """
     name = "".join(ch for ch in name.strip() if ch.isalnum() or ch in " -_").strip()
     if not name:
         raise ValueError("A scenario needs a name.")
@@ -162,6 +189,15 @@ def save(sc: ov.Scenario, name: str, author: str = "") -> None:
         _gist_write(*g, f"{PREFIX}{name}.json", copy.to_json())
     else:
         copy.save(C.SCENARIOS / f"{name}.json")
+    # Read it back. A write that raised nothing is not the same as a scenario that is in
+    # the library, and the round trip also proves the stored JSON still parses.
+    verified = False
+    try:
+        verified = load(name).digest == sc.digest
+    except (FileNotFoundError, ValueError, requests.RequestException):
+        verified = False
+    return {"name": name, "backend": backend(), "durable": durable(),
+            "verified": verified, "where": where()}
 
 
 def load(name: str) -> ov.Scenario:
