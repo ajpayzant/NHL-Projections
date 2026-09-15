@@ -214,6 +214,21 @@ FROZEN_GOALIE_COLS = [
 ]
 
 
+# What a frozen projection can be SCORED on once games have been played -- which is a
+# different question from what it DISPLAYS, and needs different columns (see `_score_block`).
+# Kept deliberately short: every stat costs two numbers a row in a file that has to fit in a
+# gist beside the edits, and these are the ones somebody actually defends a projection with.
+FROZEN_SCORE_STATS = {
+    "skaters": ["gp", "points", "goals", "assists", "shots", "pp_points"],
+    "goalies": ["gp", "starts", "wins", "saves", "goals_against", "shutouts"],
+}
+# And which of them keep their p10-p90 band, which is what lets a score say "inside the range
+# he was given" rather than only "N short". A band is two more numbers a row on top of the two
+# the stat already costs, and listing the library downloads every frozen file, so the band is
+# kept for the stats somebody argues about a range on and dropped for the rest.
+FROZEN_BAND_STATS = {"skaters": ["points", "gp"], "goalies": ["wins", "starts"]}
+
+
 def _round_for_freeze(col: str, value):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -239,6 +254,50 @@ def _freeze_block(df: pd.DataFrame, cols: list[str]) -> dict:
     rows = [[_round_for_freeze(c, r[c]) for c in cols]
             for _, r in df[cols].iterrows()]
     return {"cols": cols, "rows": rows}
+
+
+def _score_block(df: pd.DataFrame, kind: str, state) -> dict:
+    """The columns that let a frozen projection be measured against what happens NEXT.
+
+    The display tables cannot answer that question. A season total of 82 points is not a
+    claim about the future once 30 of those points are already banked, so scoring needs the
+    projection split in two -- `act_x` already done, `ros_x` still to come -- plus the games
+    the player's team had played and had left on the day it was frozen, which is the
+    denominator that turns "the rest of the season" into a window with a measurable size.
+    Those four things are exactly what `snapshots.py` files for the baseline, and they are
+    stored here under the same names so `snapshots.score_frame` scores a visitor's
+    projection and the model's own record with one piece of arithmetic.
+
+    Preseason none of it exists in the frame, because nothing is banked yet. It is written as
+    `act_x = 0, ros_x = proj_x`, which is what a preseason projection means rather than a
+    case for everything downstream to special-case -- the same convention `snapshots._slim`
+    uses, so an opening-night save is scorable from the first week of October.
+    """
+    played = state.played if len(state.played) else pd.Series(dtype=float)
+    left = state.remaining if len(state.played) else pd.Series(dtype=float)
+    team = df["team"].astype(str)
+    out = pd.DataFrame({"playerId": df["playerId"].to_numpy(), "team": team.to_numpy()})
+    out["snap_team_gp"] = team.map(played).fillna(0.0).to_numpy(dtype=float)
+    out["snap_team_left"] = team.map(left).fillna(
+        float(C.SEASON_GAMES)).to_numpy(dtype=float)
+    for stat in FROZEN_SCORE_STATS[kind]:
+        proj = f"proj_{stat}"
+        if proj not in df:
+            continue
+        out[f"act_{stat}"] = (df[f"act_{stat}"].to_numpy(dtype=float)
+                              if f"act_{stat}" in df else 0.0)
+        out[f"ros_{stat}"] = (df[f"ros_{stat}"].to_numpy(dtype=float)
+                              if f"ros_{stat}" in df else df[proj].to_numpy(dtype=float))
+        # The band on the rest-of-season half, which is the one a score can rescale onto a
+        # shorter window. Mid-season the projection carries both halves; preseason the
+        # unprefixed band already IS the rest of the season.
+        if stat not in FROZEN_BAND_STATS[kind]:
+            continue
+        for tail in ("p10", "p90"):
+            src = f"ros_{stat}_{tail}" if f"ros_{stat}_{tail}" in df else f"{stat}_{tail}"
+            if src in df:
+                out[f"ros_{stat}_{tail}"] = df[src].to_numpy(dtype=float)
+    return _freeze_block(out, list(out.columns))
 
 
 def frozen_snapshot(sc: ov.Scenario | None = None) -> dict:
@@ -274,6 +333,7 @@ def frozen_snapshot(sc: ov.Scenario | None = None) -> dict:
     if "sv_pct" in gb.columns:
         teams["team_sv_pct"] = gb["sv_pct"].reindex(tb.index).to_numpy()
 
+    state = season_state(live_token())
     return {
         "season": SEASON_LABEL,
         # What the numbers already contained when they were frozen. A season total holding
@@ -285,6 +345,15 @@ def frozen_snapshot(sc: ov.Scenario | None = None) -> dict:
         "goalies": _freeze_block(g_f, FROZEN_GOALIE_COLS),
         "teams": _freeze_block(teams.sort_values("points_budget", ascending=False),
                                list(teams.columns)),
+        # Kept apart from the display blocks on purpose: these are the columns a SCORE needs
+        # and a reader never wants in a table, and separating them means the tables a saved
+        # projection shows are byte-identical to before this existed.
+        "score": {
+            "as_of": str(state.as_of.date()),
+            "team_games_played": round(float(state.team_games_played), 2),
+            "skaters": _score_block(sk_f, "skaters", state),
+            "goalies": _score_block(g_f, "goalies", state),
+        },
     }
 
 

@@ -15,6 +15,11 @@ import streamlit as st
 
 import core
 import library
+import snapshots as sn
+# The same plain-English stat names the performance page uses, imported rather than retyped:
+# a saved projection and the model's own record are scored by identical arithmetic, so a
+# reader comparing the two pages must not be shown two vocabularies for one number.
+from views.performance import LABEL as STAT_LABEL
 
 KNOBS = [
     ("enforce_budgets", "Enforce team budgets", "bool",
@@ -285,6 +290,10 @@ FROZEN_LABELS = {
 COMPARE = {"skaters": ("proj_points", "PTS"), "goalies": ("proj_wins", "W"),
            "teams": ("points_projected", "Points projected")}
 
+MODE_AS_SAVED = "Nothing — just the numbers as they were saved"
+MODE_NOW = "What these same edits project today"
+MODE_ACTUAL = "What has actually happened since it was saved"
+
 
 def _frozen_review(pick: str) -> None:
     st.markdown("**Review one exactly as it was saved**")
@@ -314,13 +323,19 @@ def _frozen_review(pick: str) -> None:
 
     key_col = "playerId" if kind != "teams" else "team"
     now_col, now_label = COMPARE[kind]
-    compare = st.checkbox(
-        "Compare with what this scenario says today", key="frz_cmp",
-        help="Reprojects the same edits on today's data and shows the difference. The "
-             "frozen column never changes; only the comparison does.")
+
+    # Three different questions, and a reader has to be asked which one he means. "What did
+    # this say?" is the record. "What does it say now?" is the same opinion on today's data.
+    # "Was it right?" is the season answering, and it is the only one of the three that
+    # cannot be produced from the projection alone.
+    modes = [MODE_AS_SAVED, MODE_NOW] + ([] if kind == "teams" else [MODE_ACTUAL])
+    mode = st.radio("Compare against", modes, key="frz_mode", label_visibility="collapsed")
+    if mode == MODE_ACTUAL:
+        _frozen_vs_actual(snap, kind)
+        return
 
     show = frz.drop(columns=["playerId"], errors="ignore")
-    if compare:
+    if mode == MODE_NOW:
         try:
             sc_then = library.load(pick)
         except (FileNotFoundError, requests.RequestException) as exc:
@@ -359,6 +374,97 @@ def _frozen_review(pick: str) -> None:
     c2.caption(f"{len(frz)} rows, exactly as projected on "
                f"{(snap.get('frozen_at') or '')[:10]}. Deleting the scenario is the only "
                "thing that removes them.")
+
+
+def _frozen_vs_actual(snap: dict, kind: str) -> None:
+    """The saved projection against what the players have actually done since.
+
+    Scored by `snapshots.score_frame` -- the same arithmetic as the model's own record on the
+    performance page, deliberately, so a visitor's projection and the baseline can be argued
+    about in the same terms. What it compares is never the season total, which nobody knows
+    until April: it is what the save claimed about the games that were still to come, scaled
+    to the share of that window since played, against what actually happened in it.
+
+    Two errors, kept apart because they are different mistakes. The total miss includes
+    availability -- a projection of 60 points that got 40 because the player was hurt was
+    wrong about the season. The rate miss charges only the games he did play, which is the
+    half that is about hockey.
+    """
+    score = library.frozen_score(snap, kind)
+    if score.empty:
+        st.info("This one was saved without the columns a score needs — how much of each "
+                "total was already banked the day it was written — so it cannot be measured "
+                "against what happened. Reopen it and publish it again under the same name, "
+                "and every week from then on can be. Comparing it with what the same edits "
+                "project today works either way.")
+        return
+
+    scored = sn.score_frame(score, kind, min_team_games=1.0)
+    if scored.empty:
+        st.info("Nothing to score yet — no team has played a game since this was saved. "
+                "This fills in from the first week of the season onward.")
+        return
+
+    stats = [c[4:] for c in scored.columns
+             if c.startswith("obs_") and c != "obs_gp_since"]
+    # Headline stats first, so the box opens on the number the projection was about rather
+    # than on games played -- which is alphabetically innocent and reads as an odd default.
+    stats = ([s for s in sn.HEADLINE[kind] if s in stats]
+             + [s for s in stats if s not in sn.HEADLINE[kind]])
+    stat = st.selectbox("Stat", stats, format_func=lambda s: STAT_LABEL.get(s, s),
+                        key="frz_score_stat")
+
+    agg = sn.score_stats(kind, stats=[stat], players=scored, min_window_gp=1.0)
+    games = float(scored["team_games_since"].mean())
+    st.caption(f"{len(scored)} players, over the {games:.1f} team-games played on average "
+               "since this was saved.")
+    if not agg.empty:
+        row = agg.iloc[0]
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"{STAT_LABEL.get(stat, stat)} projected", f"{row['projected_per_player']:.2f}",
+                  help="per player, over the window since this was saved")
+        m2.metric("Actually happened", f"{row['observed_per_player']:.2f}",
+                  delta=f"{row['bias']:+.2f} vs projected",
+                  help="positive means the players did MORE than this projection said")
+        m3.metric("Average miss", f"{row['mae']:.2f}",
+                  help="mean absolute error per player — the size of a typical miss, "
+                       "regardless of direction")
+
+    # Names live in the display block, not the score block, so they are not stored twice.
+    frz = library.frozen_table(snap, kind)
+    if "name" in frz.columns:
+        scored = scored.merge(frz[["playerId", "name"]], on="playerId", how="left")
+
+    cols = {"name": "Player", "team": "Team", "obs_gp_since": "GP since",
+            f"exp_{stat}": "Projected", f"obs_{stat}": "Actual", f"err_{stat}": "Δ"}
+    # The rate miss is the total miss with availability divided out, so on games played
+    # themselves it is zero by construction and a column of zeros invites a wrong reading.
+    if stat != "gp":
+        cols[f"rate_err_{stat}"] = "Δ on rate"
+    if f"in_band_{stat}" in scored.columns:
+        cols[f"in_band_{stat}"] = "In range"
+    show = scored[[c for c in cols if c in scored.columns]].rename(columns=cols)
+    show = show.reindex(show["Δ"].abs().sort_values(ascending=False).index)
+
+    cfg = {"Player": st.column_config.TextColumn("Player"),
+           "Team": st.column_config.TextColumn("Team"),
+           "GP since": st.column_config.NumberColumn("GP since", format="%.0f"),
+           "Projected": st.column_config.NumberColumn("Projected", format="%.2f"),
+           "Actual": st.column_config.NumberColumn("Actual", format="%.2f"),
+           "Δ": st.column_config.NumberColumn("Miss", format="%+.2f",
+                                              help="actual minus projected"),
+           "Δ on rate": st.column_config.NumberColumn(
+               "Miss on rate", format="%+.2f",
+               help="the same miss with availability taken out — charged only on the games "
+                    "he actually played"),
+           "In range": st.column_config.CheckboxColumn(
+               "In range", help="inside the p10–p90 band this projection gave him, "
+                                "rescaled onto the shorter window")}
+    st.dataframe(show, hide_index=True, width="stretch", height=460,
+                 column_config={k: v for k, v in cfg.items() if k in show.columns})
+    st.download_button(f"Download this comparison ({kind}, CSV)",
+                       show.to_csv(index=False).encode("utf-8-sig"),
+                       file_name=f"{kind}_vs_actual.csv", mime="text/csv")
 
 
 def _now_frame(sc_then, kind: str, col: str) -> pd.DataFrame:

@@ -43,6 +43,11 @@ TIMEOUT = 20
 # So a save can carry a FROZEN copy of the numbers it produced: the projection exactly as it
 # stood, stored beside the scenario under its own name so the small readable edit file stays
 # small and readable, and so listing the library never downloads a megabyte of totals.
+#
+# The frozen file carries two things. The tables a reader wants to look at, and -- under
+# `score` -- the split of each total into what was already banked and what was still to come,
+# which is the only form in which a projection can later be measured against what actually
+# happened (`core._score_block`, scored by `snapshots.score_frame`).
 FROZEN_PREFIX = "frozen__"
 FROZEN_DIR = C.SCENARIOS / "frozen"
 
@@ -293,11 +298,27 @@ def frozen_names() -> set[str]:
     return {p.stem for p in FROZEN_DIR.glob("*.json")} if FROZEN_DIR.exists() else set()
 
 
+def _block(block: dict | None) -> "pd.DataFrame":
+    import pandas as pd
+    block = block or {}
+    return pd.DataFrame(block.get("rows") or [], columns=block.get("cols") or [])
+
+
 def frozen_table(snap: dict, kind: str) -> "pd.DataFrame":
     """One frozen table back as a DataFrame. Stored columnar, so this is the only reader."""
-    import pandas as pd
-    block = (snap or {}).get(kind) or {}
-    return pd.DataFrame(block.get("rows") or [], columns=block.get("cols") or [])
+    return _block((snap or {}).get(kind))
+
+
+def frozen_score(snap: dict, kind: str) -> "pd.DataFrame":
+    """The scorable half of a frozen projection: what it said about the games that were
+    still to come (`core._score_block`), ready for `snapshots.score_frame`.
+
+    Empty for a scenario frozen before saves started carrying it. That is not an error --
+    those saves still reopen and still compare against what the same edits project today;
+    they just cannot be measured against what happened, because nobody recorded how much of
+    each total was already banked when they were written.
+    """
+    return _block(((snap or {}).get("score") or {}).get(kind))
 
 
 def load(name: str) -> ov.Scenario:

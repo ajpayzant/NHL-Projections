@@ -85,12 +85,33 @@ opening one in December replays them against December's data — that is what ma
 keeping, and it is also why a preseason projection could not be read back as it was. So a
 save can carry a frozen copy of the projection as it stood: *Keep today's numbers with it*,
 on by default, writes a second file (`frozen__<name>.json` in the gist, `scenarios/frozen/`
-on disk — about 110 KB for 700 skaters, 94 goalies and 32 teams, stored columnar and tied to
+on disk — about 185 KB for 700 skaters, 94 goalies and 32 teams, stored columnar and tied to
 the digest of the edits it came from). Those numbers never change again; only a delete
-removes them. **Scenario → Save & share → Review one exactly as it was saved** reads them
-back, with an optional column comparing them against what the same edits project today, and
-a CSV download. Dated *baseline* projections are separate — that is `data/snapshots/` and
-the Model performance page.
+removes them.
+
+**Scenario → Save & share → Review one exactly as it was saved** reads a frozen save back
+and offers three things to compare it against, which are three different questions:
+
+| Compare against | What it answers | Needs |
+|---|---|---|
+| *Nothing — just the numbers as they were saved* | what did this projection actually say? | the frozen file |
+| *What these same edits project today* | what does the same opinion say on current data? | the edits, reprojected |
+| *What has actually happened since it was saved* | **was it right?** | the season to have started |
+
+The third one is scored by `snapshots.score_frame` — the same arithmetic as the Model
+performance page, on purpose, so a visitor's projection and the model's own record can be
+argued about in the same terms. It never scores the season total, which nobody knows until
+April: it takes what the save claimed about the games that were still to come, scales it to
+the share of that window since played, and compares it with what happened in it. The total
+miss and the miss with availability divided out are shown side by side, because being right
+about a player and wrong about how often he plays are different mistakes. This is why the
+frozen file carries `act_x` / `ros_x` per stat and the team's games played and left on the
+day (`core._score_block`) — a season total of 82 points is not a claim about the future once
+30 of them are banked. Saves frozen before that existed still reopen and still compare
+against today; they cannot be scored, and the page says so and tells you to re-publish.
+
+Dated *baseline* projections are separate — that is `data/snapshots/` and the Model
+performance page.
 
 ## The app
 

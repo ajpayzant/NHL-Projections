@@ -264,12 +264,31 @@ def score_players(kind: str = "skaters", day: str | None = None,
     snap = load(kind, day)
     if snap.empty:
         return pd.DataFrame()
+    return score_frame(snap, kind, stats, min_team_games)
+
+
+def score_frame(snap: pd.DataFrame, kind: str = "skaters",
+                stats: list[str] | None = None, min_team_games: float = 2.0
+                ) -> pd.DataFrame:
+    """The same scoring, for a snapshot-shaped frame from anywhere.
+
+    A filed baseline snapshot is one source. A visitor's frozen scenario (`app/core.py`'s
+    `frozen_snapshot`) is the other, and it has to be scored by exactly this arithmetic or
+    the model's record and somebody's own projection could not be read side by side. So the
+    window maths lives here once, and the only thing asked of `snap` is the structure a
+    score needs: `playerId`, `team`, `snap_team_gp`, `snap_team_left`, and `act_x` / `ros_x`
+    for every stat being scored.
+    """
+    if snap is None or snap.empty:
+        return pd.DataFrame()
     now = _actuals(kind)
     if now.empty:
         return pd.DataFrame()
     state = live.season_state()
+    # `ros_` rather than `proj_`: the rest-of-season half is what a score is computed from,
+    # so it is also the honest test of whether a stat can be scored at all.
     stats = stats or [s for s in (SKATER_STATS if kind == "skaters" else GOALIE_STATS)
-                      if f"proj_{s}" in snap]
+                      if f"ros_{s}" in snap]
 
     df = snap.merge(now, on="playerId", how="inner", suffixes=("", "_now"))
     # How much of the window the snapshot was projecting has since been played. Per team,
